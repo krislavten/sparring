@@ -229,13 +229,15 @@ sparring config get glm.api_key   # 取单值（敏感字段掩码）
 
 > ⚠️ **项目配置不要填 api_key**。它会跟着 git 进仓库暴露给所有协作者。api_key 只放全局 config（chmod 600）或 `SPARRING_GLM_API_KEY` 环境变量。
 
-**环境变量覆盖**（`SPARRING_*` 主推，`WORKFLOW_*` 兼容别名）：
+**环境变量覆盖（均为可选，非必需 —— 不设也能跑，key 走全局 config）**（`SPARRING_*` 主推，`WORKFLOW_*` 兼容别名）：
 
 ```bash
 export SPARRING_REVIEW_BACKEND=glm       # → review.backend
 export SPARRING_GLM_API_KEY=<id.secret>  # → glm.api_key
 export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
 ```
+
+> 💡 **API key 默认放全局 config 即可，不依赖任何环境变量。** `sparring config init` 生成 `~/.config/sparring/config.json`（chmod 600），填入 `glm.api_key` 后所有命令（含 `sparring review`、`review-code` 等）自动读取，新机器/新用户也只需各自 init 一次。`SPARRING_GLM_API_KEY` 环境变量仅作可选临时覆盖（如 CI / 临时换 key），**不是必需**。
 
 ### 可配置字段
 
@@ -341,6 +343,11 @@ sparring review-cancel <job-id>          # 取消
 sparring setup                  # 交互式安装
 sparring config init            # 生成全局配置
 sparring verify                 # 检查环境
+
+# 快速审查（不建 task；审一段结论/方案/diff，走配置的 backend）
+sparring review [--title <主题>] [<内容>]      # 内容从参数和/或 stdin 传入（可并用）
+git diff origin/main...HEAD | sparring review --title "<改动主题>"
+#   退出码 0=APPROVE  2=CONCERNS  1=调用错误/解析不出裁决
 
 # 任务
 sparring create <name> <claude|cursor>
