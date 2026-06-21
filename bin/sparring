@@ -2313,14 +2313,15 @@ config_init() {
     mkdir -p "$dir" "$(dirname "$target")"
 
     if $project_mode; then
-        # 项目级：只放 backend 选型，绝不放 api_key。
-        # 项目级配置不支持 secrets 文件 — api_key 只能放全局 config 或 SPARRING_GLM_API_KEY env。
+        # 项目级：只放团队需统一的非主观项（如 timeout/retries），绝不放 backend/model/api_key。
+        # 用什么 reviewer 后端和模型由各开发者全局配置决定，项目级不约束（写了会覆盖个人选择）。
+        # 项目级配置不支持 secrets — api_key 只能放全局 config 或 SPARRING_GLM_API_KEY env。
         cat > "$target" <<'EOF'
 {
-  "_comment": "项目级 Sparring 配置（团队共享）。切勿在这里填 api_key — 项目 config 只支持 backend 选型等非敏感字段。api_key 放全局 ~/.config/sparring/config.json 或 SPARRING_GLM_API_KEY 环境变量。",
+  "_comment": "项目级 Sparring 配置（团队共享，入库）。只放团队需要统一的非主观项（如 review.timeout / retries）。用什么 reviewer 后端和模型由各开发者的全局配置 (~/.config/sparring/config.json) 决定 —— 项目级不要设 review.backend / fallback / *.model，写了会覆盖每个人的个人选择。切勿填 api_key（放全局 config 或 SPARRING_GLM_API_KEY 环境变量）。",
   "review": {
-    "backend": "cursor",
-    "fallback": "glm"
+    "timeout": 60,
+    "retries": 1
   }
 }
 EOF
@@ -2343,8 +2344,8 @@ EOF
         fi
         echo -e "${GREEN}✓ 项目级配置已创建: ${target}${NC}"
         echo "  ${dir}/.gitignore 已就绪（屏蔽 *.local.json / *.secret.json）"
-        echo -e "${YELLOW}  ⚠ 不要在 ${target} 里填 api_key — 项目 config 只支持非敏感字段${NC}"
-        echo "  api_key 放全局: sparring config init  或  export SPARRING_GLM_API_KEY=..."
+        echo -e "${YELLOW}  ⚠ 不要在 ${target} 里设 backend / 模型 / api_key — 这些由各开发者全局配置决定${NC}"
+        echo "  全局配置（backend / 模型 / api_key）: sparring config init"
     else
         # 全局：含 key 占位符。chmod 600
         cat > "$target" <<'EOF'
