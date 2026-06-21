@@ -1198,6 +1198,86 @@ call_agent() {
     call_reviewer "$@"
 }
 
+# ─── 一次性 ad-hoc 审查 ──────────────────────────────────────
+# 审查一段结论/方案/diff，不创建 task，直接走配置的 review backend（默认 glm）。
+# 填补 task 制 review-proposal/review-code 之外的「快速审一条结论」场景。
+review_adhoc() {
+    local title=""
+    local content=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}错误: --title 需要一个参数${NC}" >&2
+                    return 1
+                fi
+                title="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat >&2 <<'USAGE'
+用法: sparring review [--title <主题>] [<内容>]
+  审查一段结论/方案/diff，不创建 task；内容由参数和/或 stdin 传入。
+  走当前配置的 review backend（review.backend，默认 glm）。
+  退出码: 0=APPROVE  2=CONCERNS  1=调用错误
+示例:
+  echo "<上下文+结论>" | sparring review
+  git diff origin/main...HEAD | sparring review --title "改动主题"
+USAGE
+                return 0
+                ;;
+            *)
+                content="${content:+$content }$1"
+                shift
+                ;;
+        esac
+    done
+
+    # 追加 stdin（管道/重定向）
+    if [[ ! -t 0 ]]; then
+        local piped
+        piped=$(cat)
+        if [[ -n "$piped" ]]; then
+            if [[ -n "$content" ]]; then
+                content="$content"$'\n\n'"$piped"
+            else
+                content="$piped"
+            fi
+        fi
+    fi
+
+    if [[ -z "${content//[[:space:]]/}" ]]; then
+        echo -e "${RED}错误: 没有收到要审查的内容（用参数或 stdin 传入）${NC}" >&2
+        return 1
+    fi
+
+    if [[ -n "$title" ]]; then
+        content="【审查主题】${title}"$'\n\n'"$content"
+    fi
+
+    local result rc=0
+    result=$(call_reviewer "$content" "") || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        return $rc
+    fi
+
+    printf '%s\n' "$result"
+
+    # 退出码反映结论。严格匹配列首大写裁决词（reviewer prompt 强制此格式），
+    # 不用 -i、不容前导空格，避免审查正文里的 approve/concerns 误命中。
+    # 解析不出明确裁决时 return 1（按错误处理，绝不默认放行 — 触发铁律兜底）。
+    local verdict
+    verdict=$(printf '%s' "$result" | grep -m1 -oE '^(APPROVE|CONCERNS)' || true)
+    case "$verdict" in
+        APPROVE)  return 0 ;;
+        CONCERNS) return 2 ;;
+        *)
+            echo -e "${YELLOW}⚠ 无法从 reviewer 输出解析出 APPROVE/CONCERNS 裁决，按调用错误处理（exit 1）${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
 # ─── 初始化 ─────────────────────────────────────────────────
 
 init_workflow() {
@@ -2635,6 +2715,7 @@ main() {
         init)                init_workflow ;;
         create)              create_task "$@" ;;
         propose)             propose "$@" ;;
+        review)              review_adhoc "$@" ;;
         review-proposal)     review_proposal "$@" ;;
         review-proposal-bg)  review_proposal_bg "$@" ;;
         auto-review-proposal) auto_review_proposal "$@" ;;
@@ -2669,6 +2750,11 @@ ${DIM}(兼容别名: workflow，历史脚本仍可用)${NC}
 ${YELLOW}初始化:${NC}
   ${GREEN}setup${NC}                         交互式初始化 (选择模型、配置 Issue 模式)
   ${GREEN}verify${NC}                        验证环境 (依赖、review backend 连通性)
+
+${YELLOW}快速审查 (不建 task):${NC}
+  ${GREEN}review${NC} [--title <主题>] [<内容>]  审一段结论/方案/diff，内容由参数或 stdin 传入
+                                走配置的 backend(默认 glm)；退出码 0=APPROVE 2=CONCERNS 1=错误
+                                例: git diff origin/main...HEAD | sparring review --title "改动"
 
 ${YELLOW}任务管理:${NC}
   ${GREEN}init${NC}                          初始化工作流目录
