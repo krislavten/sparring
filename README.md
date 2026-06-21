@@ -56,7 +56,7 @@ Sparring 是 Claude Code 的插件。它给 Claude 配一个"对手"——专门
 <td width="50%">
 
 ### ⚙️ 四层配置系统
-**内置默认 → 全局 config → 项目 config → 环境变量**。API key 放全局（chmod 600），backend 选型放项目（团队共享），临时覆盖走 env。一键 `sparring config init` 初始化。
+**内置默认 → 全局 config → 项目 config → 环境变量**。API key、backend、模型放全局（各开发者自己，chmod 600）；项目 config 只放团队需统一的非主观项（超时/重试），不约束用谁/什么模型审查；临时覆盖走 env。一键 `sparring config init` 初始化。
 
 </td>
 <td width="50%">
@@ -173,7 +173,7 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 ⚠ 主 backend Cursor Agent 调用失败，降级到 GLM...
 ```
 
-**三种典型组合**：
+**三种典型组合**（写进你**全局**配置 `~/.config/sparring/config.json`，按个人偏好；项目级不要设 backend）：
 
 ```jsonc
 // A) Cursor 主 + GLM 备（推荐，Cursor 抽风也不阻塞）
@@ -194,7 +194,7 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 
 ```bash
 sparring config init              # 生成 ~/.config/sparring/config.json（chmod 600，存 api_key）
-sparring config init project      # 生成 .sparring/config.json（团队共享，不放 key）
+sparring config init project      # 生成 .sparring/config.json（团队共享非主观项，不放 backend/模型/key）
 sparring config show              # 看合并后的配置（key 自动掩码）
 sparring config get glm.api_key   # 取单值（敏感字段掩码）
 ```
@@ -216,18 +216,18 @@ sparring config get glm.api_key   # 取单值（敏感字段掩码）
 }
 ```
 
-**项目配置** `.sparring/config.json`（**默认入库**，团队共享 backend 选型）：
+**项目配置** `.sparring/config.json`（**默认入库**，只放团队需统一的非主观项，如超时/重试）：
 
 ```json
 {
   "review": {
-    "backend": "cursor",
-    "fallback": "glm"
+    "timeout": 60,
+    "retries": 1
   }
 }
 ```
 
-> ⚠️ **项目配置不要填 api_key**。它会跟着 git 进仓库暴露给所有协作者。api_key 只放全局 config（chmod 600）或 `SPARRING_GLM_API_KEY` 环境变量。
+> ⚠️ **项目配置不要设 `review.backend` / `fallback` / 模型 / `api_key`**。用什么 reviewer 后端和模型由**各开发者自己的全局配置**决定，项目级不约束（项目 config 优先级高于全局，写了会覆盖每个人的个人选择）；api_key 更不能入库。
 
 **环境变量覆盖（均为可选，非必需 —— 不设也能跑，key 走全局 config）**（`SPARRING_*` 主推，`WORKFLOW_*` 兼容别名）：
 
