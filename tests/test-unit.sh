@@ -79,6 +79,8 @@ source_workflow_funcs() {
     unset WORKFLOW_GLM_MAX_TOKENS WORKFLOW_GLM_TEMPERATURE WORKFLOW_GLM_API_BASE
     unset SPARRING_REVIEW_BACKEND SPARRING_REVIEW_FALLBACK SPARRING_REVIEW_TIMEOUT SPARRING_REVIEW_RETRIES
     unset SPARRING_GLM_API_KEY SPARRING_GLM_MODEL SPARRING_CURSOR_MODEL
+    unset SPARRING_CLAUDE_BASE_URL SPARRING_CLAUDE_API_KEY SPARRING_CLAUDE_MODEL
+    unset SPARRING_CLAUDE_CONFIG_DIR SPARRING_CLAUDE_USE_PROXY SPARRING_CLAUDE_EXTRA_ARGS
 
     # Source the workflow script but replace main() and set -euo to prevent issues
     eval "$(sed -e 's/^main "$@"/# main disabled for testing/' \
@@ -367,6 +369,22 @@ test_review_backend_glm_uppercase() {
 }
 test_review_backend_glm_uppercase
 
+test_review_backend_claude() {
+    source_workflow_funcs
+    local backend
+    backend=$(WORKFLOW_REVIEW_BACKEND=claude get_review_backend)
+    assert_eq "claude review backend" "claude" "$backend"
+}
+test_review_backend_claude
+
+test_review_backend_claude_uppercase() {
+    source_workflow_funcs
+    local backend
+    backend=$(WORKFLOW_REVIEW_BACKEND=Claude get_review_backend)
+    assert_eq "claude backend case-insensitive" "claude" "$backend"
+}
+test_review_backend_claude_uppercase
+
 echo ""
 echo "=== fallback backend ==="
 
@@ -387,6 +405,14 @@ test_fallback_glm() {
 }
 test_fallback_glm
 
+test_fallback_claude() {
+    source_workflow_funcs
+    local fb
+    fb=$(WORKFLOW_REVIEW_BACKEND_FALLBACK=claude get_review_backend_fallback)
+    assert_eq "fallback claude" "claude" "$fb"
+}
+test_fallback_claude
+
 test_fallback_invalid() {
     source_workflow_funcs
     local status=0
@@ -402,6 +428,163 @@ test_reviewer_label_glm() {
     assert_eq "glm label" "GLM" "$label"
 }
 test_reviewer_label_glm
+
+test_reviewer_label_claude() {
+    source_workflow_funcs
+    local label
+    label=$(reviewer_label_for_backend "claude")
+    assert_eq "claude label" "Claude Code" "$label"
+}
+test_reviewer_label_claude
+
+test_reviewer_name_claude() {
+    source_workflow_funcs
+    local name
+    name=$(reviewer_name_for_backend "claude")
+    assert_eq "claude name" "claude" "$name"
+}
+test_reviewer_name_claude
+
+echo ""
+echo "=== claude backend config & check ==="
+
+test_claude_config_defaults() {
+    source_workflow_funcs
+    # 注意: jq 的 `//` 把布尔 false 和 null 都当 "empty"，故默认 false 读出来是空串。
+    # 代码只比较 `== "true"`（空串视为 not-true → 清代理），行为正确，这里断言"非 true"语义。
+    assert_eq "claude.use_proxy default is falsy (not 'true')" "" "$(_config_get claude.use_proxy)"
+    assert_eq "claude.model default null→empty" "" "$(_config_get claude.model)"
+    assert_eq "claude.base_url default null→empty" "" "$(_config_get claude.base_url)"
+    # 用户显式设 true（布尔）应被正确读为 "true"
+    assert_eq "claude.use_proxy=true(bool) reads as true" "true" \
+        "$(SPARRING_CLAUDE_USE_PROXY=true _config_get claude.use_proxy)"
+}
+test_claude_config_defaults
+
+# check_claude 需要 claude 在 PATH；用临时 fake 二进制隔离测试鉴权分支逻辑
+_make_fake_claude() {
+    local dir="$TMP_DIR/fake-claude-$RANDOM"
+    mkdir -p "$dir"
+    printf '#!/bin/bash\necho "1.0.0 (fake)"\n' > "$dir/claude"
+    chmod +x "$dir/claude"
+    echo "$dir"
+}
+
+test_check_claude_base_url_requires_key() {
+    source_workflow_funcs
+    local fakebin status=0
+    fakebin=$(_make_fake_claude)
+    # 配了 base_url 但没 api_key → 必须失败
+    PATH="$fakebin:$PATH" SPARRING_CLAUDE_BASE_URL="https://x.test/anthropic" \
+        check_claude 2>/dev/null || status=$?
+    assert_eq "base_url without api_key fails" "1" "$status"
+}
+test_check_claude_base_url_requires_key
+
+test_check_claude_base_url_with_key_ok() {
+    source_workflow_funcs
+    local fakebin status=0
+    fakebin=$(_make_fake_claude)
+    PATH="$fakebin:$PATH" SPARRING_CLAUDE_BASE_URL="https://x.test/anthropic" \
+        SPARRING_CLAUDE_API_KEY="tok-123" \
+        check_claude 2>/dev/null || status=$?
+    assert_eq "base_url with api_key passes" "0" "$status"
+}
+test_check_claude_base_url_with_key_ok
+
+test_check_claude_native_no_key_ok() {
+    source_workflow_funcs
+    local fakebin status=0
+    fakebin=$(_make_fake_claude)
+    # 原生路径（无 base_url）不强制 api_key
+    PATH="$fakebin:$PATH" check_claude 2>/dev/null || status=$?
+    assert_eq "native path needs no key" "0" "$status"
+}
+test_check_claude_native_no_key_ok
+
+echo ""
+echo "=== call_claude_agent env 注入 & 命令组装 (mock claude) ==="
+
+# mock claude：把收到的 argv + 关键 env + PWD dump 到 $CLAUDE_MOCK_DUMP，再回 APPROVE。
+# 用它验证隔离机制的核心：第三方 env 注入、清空 ANTHROPIC_API_KEY、禁工具、空 cwd 运行。
+_make_mock_claude() {
+    local dir="$TMP_DIR/mock-claude-$RANDOM"
+    mkdir -p "$dir"
+    cat > "$dir/claude" <<'MOCK'
+#!/bin/bash
+# 把变量状态归一为 UNSET / EMPTY / SET，避免 grep 断言碰到 [] 正则 / -- 选项坑
+_state() { if [ -z "${!1+x}" ]; then echo UNSET; elif [ -z "${!1}" ]; then echo EMPTY; else echo SET; fi; }
+# argv 用换行分隔，断言可逐 token 精确匹配（避开 "--model" 被 grep 当选项）
+ARGV_NL=$(printf '%s\n' "$@")
+{
+  echo "PWD: $PWD"
+  echo "BASE_URL: ${ANTHROPIC_BASE_URL:-<unset>}"
+  echo "AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-<unset>}"
+  echo "MODEL_ENV: ${ANTHROPIC_MODEL:-<unset>}"
+  echo "API_KEY_STATE: $(_state ANTHROPIC_API_KEY)"
+  echo "HTTP_PROXY_STATE: $(_state HTTP_PROXY)"
+  echo "CONFIG_DIR: ${CLAUDE_CONFIG_DIR:-<unset>}"
+  echo "HAS_MODEL_FLAG: $(echo "$ARGV_NL" | grep -qx -- '--model' && echo yes || echo no)"
+  echo "MODEL_FLAG_VAL: $(echo "$ARGV_NL" | grep -A1 -x -- '--model' | tail -1)"
+  echo "HAS_DISALLOWED: $(echo "$ARGV_NL" | grep -qx -- '--disallowedTools' && echo yes || echo no)"
+  echo "HAS_PRINT: $(echo "$ARGV_NL" | grep -qx -- '-p' && echo yes || echo no)"
+} > "$CLAUDE_MOCK_DUMP"
+cat > /dev/null 2>&1 || true
+echo "APPROVE"
+echo "mock verdict"
+MOCK
+    chmod +x "$dir/claude"
+    echo "$dir"
+}
+
+test_call_claude_thirdparty_injection() {
+    source_workflow_funcs
+    local mockdir result dump
+    mockdir=$(_make_mock_claude)
+    export CLAUDE_MOCK_DUMP="$TMP_DIR/dump-3p-$RANDOM.txt"
+    # 故意预置一个"残留真 key" + 代理，验证第三方路径会把它们清掉
+    result=$(PATH="$mockdir:$PATH" \
+        SPARRING_CLAUDE_BASE_URL="https://x.test/anthropic" \
+        SPARRING_CLAUDE_API_KEY="tok-xyz" \
+        SPARRING_CLAUDE_MODEL="deepseek-chat" \
+        ANTHROPIC_API_KEY="leaked-real-key" \
+        HTTP_PROXY="http://127.0.0.1:7897" \
+        call_claude_agent "请审查这段代码" 2>/dev/null)
+    dump=$(cat "$CLAUDE_MOCK_DUMP" 2>/dev/null)
+    assert_contains "returns mock verdict" "APPROVE" "$result"
+    assert_contains "injects ANTHROPIC_BASE_URL" "BASE_URL: https://x.test/anthropic" "$dump"
+    assert_contains "injects ANTHROPIC_AUTH_TOKEN" "AUTH_TOKEN: tok-xyz" "$dump"
+    assert_contains "injects ANTHROPIC_MODEL" "MODEL_ENV: deepseek-chat" "$dump"
+    assert_contains "clears残留 ANTHROPIC_API_KEY 为空" "API_KEY_STATE: EMPTY" "$dump"
+    assert_contains "passes model flag" "HAS_MODEL_FLAG: yes" "$dump"
+    assert_contains "model flag value correct" "MODEL_FLAG_VAL: deepseek-chat" "$dump"
+    assert_contains "passes disallowedTools flag" "HAS_DISALLOWED: yes" "$dump"
+    assert_contains "print mode flag present" "HAS_PRINT: yes" "$dump"
+    assert_contains "clears HTTP_PROXY 为空" "HTTP_PROXY_STATE: EMPTY" "$dump"
+    assert_contains "runs in isolated temp cwd" "sparring-claude-cwd" "$dump"
+    assert_contains "third-party uses ephemeral config dir" "sparring-claude-cfg" "$dump"
+    unset CLAUDE_MOCK_DUMP ANTHROPIC_API_KEY HTTP_PROXY
+}
+test_call_claude_thirdparty_injection
+
+test_call_claude_native_no_thirdparty_env() {
+    source_workflow_funcs
+    local mockdir result dump
+    mockdir=$(_make_mock_claude)
+    export CLAUDE_MOCK_DUMP="$TMP_DIR/dump-native-$RANDOM.txt"
+    # 原生路径（无 base_url）→ 不注入第三方 env，config dir 复用 ~/.claude
+    result=$(PATH="$mockdir:$PATH" SPARRING_CLAUDE_MODEL="claude-opus-4-8" \
+        call_claude_agent "请审查这段代码" 2>/dev/null)
+    dump=$(cat "$CLAUDE_MOCK_DUMP" 2>/dev/null)
+    assert_contains "returns mock verdict" "APPROVE" "$result"
+    assert_contains "native: no ANTHROPIC_BASE_URL" "BASE_URL: <unset>" "$dump"
+    assert_contains "native: no ANTHROPIC_AUTH_TOKEN" "AUTH_TOKEN: <unset>" "$dump"
+    assert_contains "native: config_dir 复用 ~/.claude" "CONFIG_DIR: $HOME/.claude" "$dump"
+    assert_contains "native: 仍禁工具" "HAS_DISALLOWED: yes" "$dump"
+    assert_contains "native: 仍空 cwd 隔离" "sparring-claude-cwd" "$dump"
+    unset CLAUDE_MOCK_DUMP
+}
+test_call_claude_native_no_thirdparty_env
 
 echo ""
 echo "=== call_reviewer fallback behavior ==="
