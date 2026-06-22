@@ -8,7 +8,7 @@
 <p align="center">
   <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-2_min-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-core-features"><img src="https://img.shields.io/badge/Features-4_pillars-purple?style=for-the-badge" alt="Features"></a>
-  <a href="#-reviewer-backends"><img src="https://img.shields.io/badge/Backends-Cursor_%7C_Codex_%7C_GLM-green?style=for-the-badge" alt="Backends"></a>
+  <a href="#-reviewer-backends"><img src="https://img.shields.io/badge/Backends-Cursor_%7C_Codex_%7C_GLM_%7C_Claude-green?style=for-the-badge" alt="Backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
@@ -29,6 +29,7 @@ Sparring is a Claude Code plugin. It pairs Claude with a designated opponent —
 
 ## 📰 What's New
 
+- **2026-06** · 🧠 New **`claude` backend**: run review via the Claude Code CLI (`claude -p`), and **swap the backend model** — point Claude Code at GLM / DeepSeek and other Anthropic-compatible endpoints. Ships with reviewer context isolation (empty cwd + dedicated config dir) + all-tools-disabled, eliminating `CLAUDE.md` pollution and recursion
 - **2026-05** · 🔥 **Zhipu GLM** joins as a third reviewer backend with primary/fallback auto-degradation; new JSON config system (`~/.config/sparring/config.json` + `.sparring/config.json`) for team sharing; repo officially renamed to `sparring` (legacy `workflow` CLI preserved as a symlink)
 - **2026-04** · 🎯 Added **Codex CLI** backend + background review jobs (run long reviews asynchronously)
 - **2026-03** · Initial release: Claude + Cursor dual-AI collaboration with up to 5-round review; GitHub Issue–driven workflow (claim tasks from a Project board, sync discussions to Issue comments)
@@ -47,8 +48,8 @@ One AI writes. Another finds flaws. Not mutual praise — mutual pressure, like 
 </td>
 <td width="50%">
 
-### 🎛️ Three Backends + Primary/Fallback
-Choose `cursor` / `codex` / `glm`, or combine them as primary + fallback. When the primary CLI fails (timeout / network / process crash) the workflow auto-degrades to the fallback — no stall.
+### 🎛️ Four Backends + Primary/Fallback
+Choose `cursor` / `codex` / `glm` / `claude`, or combine them as primary + fallback. When the primary CLI fails (timeout / network / process crash) the workflow auto-degrades to the fallback — no stall.
 
 </td>
 </tr>
@@ -157,13 +158,14 @@ That's it. Claude writes the proposal → Cursor challenges → you approve → 
 
 ## 🎛️ Reviewer Backends
 
-Three backends, freely combinable as primary + fallback:
+Four backends, freely combinable as primary + fallback:
 
 | Backend | Account | Notes | Best for |
 |---------|---------|-------|---------|
 | 🤖 `cursor` | Cursor subscription | Default, `gpt-5.5-extra-high` | Daily driver |
 | 🧪 `codex` | OpenAI subscription | Codex CLI, tunable reasoning | Codex quota to burn |
 | 🌟 `glm` | Zhipu pay-as-you-go | Just needs an API key | Fallback / no subscription |
+| 🧠 `claude` | Claude Code CLI | Runs review via `claude -p`; can **swap the backend model** (native Claude / GLM / DeepSeek...) | Use the Claude Code harness, or drive a third-party model with it |
 
 ### Primary + Fallback
 
@@ -173,7 +175,7 @@ If the primary backend fails (timeout / network error / CLI crash), Sparring **a
 ⚠ Primary backend Cursor Agent failed, falling back to GLM...
 ```
 
-**Three common setups**:
+**Common setups**:
 
 ```jsonc
 // A) Cursor primary + GLM fallback (recommended — survives Cursor outages)
@@ -184,7 +186,41 @@ If the primary backend fails (timeout / network error / CLI crash), Sparring **a
 
 // C) GLM only (no subscription, pay-as-you-go)
 { "review": { "backend": "glm" } }
+
+// D) Claude Code (native — uses your logged-in Claude)
+{ "review": { "backend": "claude" },
+  "claude": { "model": "claude-opus-4-8" } }
 ```
+
+### 🧠 `claude` backend: run third-party models through Claude Code
+
+The `claude` backend runs review via the **Claude Code CLI (`claude -p`)**. Beyond native Claude, you can **swap the backend model to GLM / DeepSeek / etc.** by pointing `claude.base_url` + `api_key` + `model` at each vendor's **Anthropic-compatible endpoint**:
+
+```jsonc
+// Claude Code running GLM
+{ "review": { "backend": "claude" },
+  "claude": {
+    "base_url": "https://open.bigmodel.cn/api/anthropic",
+    "api_key": "<glm-key>",
+    "model": "glm-5.2"
+  } }
+
+// Claude Code running DeepSeek, native GLM as fallback
+{ "review": { "backend": "claude", "fallback": "glm" },
+  "claude": {
+    "base_url": "https://api.deepseek.com/anthropic",
+    "api_key": "<deepseek-key>",
+    "model": "deepseek-chat"
+  } }
+```
+
+How it works & isolation (important):
+
+- **Native Claude**: leave `base_url` empty — reuses your logged-in Claude Code (OAuth subscription or `ANTHROPIC_API_KEY`), zero extra config.
+- **Third-party model**: set `base_url` (`api_key` then **required**) → injects `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`, and explicitly clears `ANTHROPIC_API_KEY` so a stray local key can't hijack auth and 401.
+- **Context isolation**: the reviewer always runs inside an empty `mktemp` dir (blocks project `CLAUDE.md`); third-party path also uses a fresh empty `CLAUDE_CONFIG_DIR` (blocks global `CLAUDE.md` + residual login). The **native path** loads `~/.claude/CLAUDE.md` — `verify` warns about it; set `claude.config_dir` to a "logged-in but CLAUDE.md-free" dir to fully isolate.
+- **All tools disabled**: `-p` default-deny + `--disallowedTools` → the reviewer only emits a plain-text verdict, physically can't run Bash/Task, so recursion is impossible.
+- **Proxy**: domestic endpoints (GLM/DeepSeek) clear `HTTP(S)_PROXY` by default (a proxy breaks them); set `claude.use_proxy: true` if native Anthropic needs a proxy.
 
 ---
 

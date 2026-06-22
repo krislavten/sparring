@@ -8,7 +8,7 @@
 <p align="center">
   <a href="#-快速开始"><img src="https://img.shields.io/badge/Quick_Start-2_min-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-核心特性"><img src="https://img.shields.io/badge/Features-4_pillars-purple?style=for-the-badge" alt="Features"></a>
-  <a href="#-审查后端"><img src="https://img.shields.io/badge/Backends-Cursor_%7C_Codex_%7C_GLM-green?style=for-the-badge" alt="Backends"></a>
+  <a href="#-审查后端"><img src="https://img.shields.io/badge/Backends-Cursor_%7C_Codex_%7C_GLM_%7C_Claude-green?style=for-the-badge" alt="Backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
@@ -29,6 +29,7 @@ Sparring 是 Claude Code 的插件。它给 Claude 配一个"对手"——专门
 
 ## 📰 What's New
 
+- **2026-06** · 🧠 新增 **`claude` 后端**：用 Claude Code CLI（`claude -p`）跑 review，并支持**换后端模型**——把 Claude Code 指向 GLM / DeepSeek 等 Anthropic 兼容端点。内置 reviewer 上下文隔离（空 cwd + 独立 config dir）+ 禁全部工具，杜绝 `CLAUDE.md` 污染与递归
 - **2026-05** · 🔥 支持**智谱 GLM** 作为第三个审查后端，配合主/备降级机制；新增 JSON 配置系统（`~/.config/sparring/config.json` + `.sparring/config.json`），支持团队共享；仓库正式更名为 `sparring`（旧 `workflow` 命令保留为软链兼容）
 - **2026-04** · 🎯 新增 **Codex CLI** 后端 + 后台 review job（长耗时 review 可异步跑）
 - **2026-03** · 首发：Claude + Cursor 双 AI 协作 + 最多 5 轮 review 机制；GitHub Issue 驱动工作流（从 Project 看板接任务，讨论自动同步到 Issue 评论）
@@ -47,8 +48,8 @@ Sparring 是 Claude Code 的插件。它给 Claude 配一个"对手"——专门
 </td>
 <td width="50%">
 
-### 🎛️ 三后端可选 + 主备降级
-`cursor` / `codex` / `glm` 任选，还能配主+备。主 backend CLI 调用失败时（超时 / 网络错 / 进程异常退出）自动切备，工作流不阻塞。
+### 🎛️ 四后端可选 + 主备降级
+`cursor` / `codex` / `glm` / `claude` 任选，还能配主+备。主 backend CLI 调用失败时（超时 / 网络错 / 进程异常退出）自动切备，工作流不阻塞。
 
 </td>
 </tr>
@@ -157,13 +158,14 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 
 ## 🎛️ 审查后端
 
-三种 backend，可自由组合主备：
+四种 backend，可自由组合主备：
 
 | Backend | 账号 | 特点 | 推荐场景 |
 |---------|------|------|---------|
 | 🤖 `cursor` | Cursor 订阅 | 默认后端，`gpt-5.5-extra-high` | 日常主力 |
 | 🧪 `codex` | OpenAI 订阅 | Codex CLI，reasoning 可调 | Codex 额度充足 |
 | 🌟 `glm` | 智谱按量付费 | 国产、API key 就能用 | 降级兜底 / 无订阅 |
+| 🧠 `claude` | Claude Code CLI | 用 `claude -p` 跑 review；可**换后端模型**（原生 Claude / GLM / DeepSeek...） | 想用 Claude Code harness，或拿它驱动第三方模型 |
 
 ### 主 + 备降级
 
@@ -173,7 +175,7 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 ⚠ 主 backend Cursor Agent 调用失败，降级到 GLM...
 ```
 
-**三种典型组合**（写进你**全局**配置 `~/.config/sparring/config.json`，按个人偏好；项目级不要设 backend）：
+**典型组合**（写进你**全局**配置 `~/.config/sparring/config.json`，按个人偏好；项目级不要设 backend）：
 
 ```jsonc
 // A) Cursor 主 + GLM 备（推荐，Cursor 抽风也不阻塞）
@@ -184,7 +186,41 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 
 // C) 纯 GLM（无订阅，按量付费）
 { "review": { "backend": "glm" } }
+
+// D) Claude Code（原生，用本机已登录的 Claude）
+{ "review": { "backend": "claude" },
+  "claude": { "model": "claude-opus-4-8" } }
 ```
+
+### 🧠 `claude` 后端：用 Claude Code 跑第三方模型
+
+`claude` 后端通过 **Claude Code CLI（`claude -p` 非交互模式）** 执行 review。除了用原生 Claude，还能把后端模型**换成 GLM / DeepSeek 等**——机制是设 `claude.base_url` + `api_key` + `model` 指向各家的 **Anthropic 兼容端点**：
+
+```jsonc
+// Claude Code 跑 GLM
+{ "review": { "backend": "claude" },
+  "claude": {
+    "base_url": "https://open.bigmodel.cn/api/anthropic",
+    "api_key": "<glm-key>",
+    "model": "glm-5.2"
+  } }
+
+// Claude Code 跑 DeepSeek，GLM 原生兜底
+{ "review": { "backend": "claude", "fallback": "glm" },
+  "claude": {
+    "base_url": "https://api.deepseek.com/anthropic",
+    "api_key": "<deepseek-key>",
+    "model": "deepseek-chat"
+  } }
+```
+
+工作机制与隔离（重要）：
+
+- **原生 Claude**：`base_url` 留空，复用本机已登录的 Claude Code（OAuth 订阅或 `ANTHROPIC_API_KEY`），零额外配置。
+- **第三方模型**：设 `base_url`（非空时 `api_key` **必填**）→ 注入 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`，并显式清空 `ANTHROPIC_API_KEY` 防本机残留 key 抢鉴权报 401。
+- **上下文隔离**：reviewer 一律在 `mktemp` 空目录里运行（隔断项目 `CLAUDE.md`）；第三方路径再用全新空 `CLAUDE_CONFIG_DIR`（隔断全局 `CLAUDE.md` + 残留登录态）。**原生路径**会加载 `~/.claude/CLAUDE.md`——`verify` 会告警，可设 `claude.config_dir` 指向一个「已登录但无 CLAUDE.md」的目录彻底隔离。
+- **禁全部工具**：`-p` 默认拒权 + `--disallowedTools` 兜底 → reviewer 只输出纯文本裁决，物理上跑不了 Bash/Task，递归不可能。
+- **代理**：国产端点（GLM/DeepSeek）默认清空 `HTTP(S)_PROXY`（走代理会失败）；原生 Anthropic 墙内需要时设 `claude.use_proxy: true`。
 
 ---
 
@@ -243,7 +279,7 @@ export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
 
 | key | 默认 | 说明 |
 |---|---|---|
-| `review.backend` | `cursor` | 主后端：`cursor` / `codex` / `glm` |
+| `review.backend` | `cursor` | 主后端：`cursor` / `codex` / `glm` / `claude` |
 | `review.fallback` | `null` | 备后端（可选） |
 | `review.timeout` | `60` | 单次调用超时秒数 |
 | `review.retries` | `1` | 失败后重试次数（共尝试 retries+1 次） |
@@ -257,6 +293,12 @@ export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
 | `glm.max_tokens` | `8192` | 开 thinking 时建议调到 `65536` |
 | `glm.temperature` | `0.3` | review 场景不需要太高 |
 | `glm.api_base` | 官方 URL | 可换自建网关 |
+| `claude.model` | `null` | 后端模型；原生留空走已登录账号，第三方填如 `glm-5.2` / `deepseek-chat` |
+| `claude.base_url` | `null` | 设了即「第三方模型」路径，指向各家 Anthropic 兼容端点；留空 = 原生 Claude |
+| `claude.api_key` | 第三方路径**必填** | 第三方端点 token（→ `ANTHROPIC_AUTH_TOKEN`）；原生路径走 OAuth 不需要 |
+| `claude.config_dir` | `null` | `CLAUDE_CONFIG_DIR`，隔离 reviewer 配置；第三方路径默认每次全新空目录 |
+| `claude.use_proxy` | `false` | 是否保留 `HTTP(S)_PROXY`；国产端点须 `false`，原生 Anthropic 墙内可 `true` |
+| `claude.extra_args` | `null` | 附加 `claude` CLI 参数（逃生舱） |
 
 完整清单随时用 `sparring config show` 查看。
 

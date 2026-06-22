@@ -53,7 +53,7 @@ _normalize_backend() {
     local backend="$1"
     backend=$(printf '%s' "$backend" | tr '[:upper:]' '[:lower:]')
     case "$backend" in
-        cursor|codex|glm) echo "$backend"; return 0 ;;
+        cursor|codex|glm|claude) echo "$backend"; return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -64,7 +64,7 @@ get_review_backend() {
     [[ -z "$raw" ]] && raw="$REVIEW_BACKEND_DEFAULT"
     local backend
     if ! backend=$(_normalize_backend "$raw"); then
-        echo -e "${RED}错误: review.backend 仅支持 cursor / codex / glm${NC}" >&2
+        echo -e "${RED}错误: review.backend 仅支持 cursor / codex / glm / claude${NC}" >&2
         echo "  收到: '${raw}'" >&2
         return 1
     fi
@@ -78,7 +78,7 @@ get_review_backend_fallback() {
     [[ -z "$raw" ]] && return 0
     local backend
     if ! backend=$(_normalize_backend "$raw"); then
-        echo -e "${RED}错误: review.fallback 仅支持 cursor / codex / glm${NC}" >&2
+        echo -e "${RED}错误: review.fallback 仅支持 cursor / codex / glm / claude${NC}" >&2
         echo "  收到: '${raw}'" >&2
         return 1
     fi
@@ -91,6 +91,7 @@ reviewer_name_for_backend() {
         cursor) echo "cursor" ;;
         codex)  echo "codex" ;;
         glm)    echo "glm" ;;
+        claude) echo "claude" ;;
         *)      echo "$backend" ;;
     esac
 }
@@ -101,6 +102,7 @@ reviewer_label_for_backend() {
         cursor) echo "Cursor Agent" ;;
         codex)  echo "Codex CLI" ;;
         glm)    echo "GLM" ;;
+        claude) echo "Claude Code" ;;
         *)      echo "$backend" ;;
     esac
 }
@@ -185,6 +187,27 @@ check_glm() {
     fi
 }
 
+check_claude() {
+    if ! command -v claude &>/dev/null; then
+        echo -e "${RED}错误: 未找到 claude 命令 (Claude Code CLI)${NC}" >&2
+        echo "  请安装: npm install -g @anthropic-ai/claude-code" >&2
+        return 1
+    fi
+    # 第三方模型路径（配了 base_url）必须有 api_key；原生路径走 OAuth 登录，不强制
+    local base_url key
+    base_url=$(_config_get claude.base_url)
+    if [[ -n "$base_url" ]]; then
+        key=$(_config_get claude.api_key)
+        if [[ -z "$key" ]]; then
+            echo -e "${RED}错误: 配置了 claude.base_url 必须同时配 claude.api_key${NC}" >&2
+            echo "  方式1: sparring config init 写入 ~/.config/sparring/config.json" >&2
+            echo "  方式2: export SPARRING_CLAUDE_API_KEY=<token>" >&2
+            echo "  (第三方端点用 token 鉴权；留空 base_url 则走本机已登录的 Claude Code)" >&2
+            return 1
+        fi
+    fi
+}
+
 # ─── 项目根目录查找（向上查找 .workflow 或 .git） ──────────
 
 find_project_root() {
@@ -242,6 +265,14 @@ _config_defaults() {
     "max_tokens": 8192,
     "temperature": 0.3,
     "api_base": "https://open.bigmodel.cn/api/paas/v4"
+  },
+  "claude": {
+    "model": null,
+    "base_url": null,
+    "api_key": null,
+    "config_dir": null,
+    "use_proxy": false,
+    "extra_args": null
   }
 }
 EOF
@@ -1142,6 +1173,134 @@ ${prompt}"
     echo "$result"
 }
 
+# 通过 Claude Code CLI（claude -p 非交互打印模式）做 review。
+# 两种用法：
+#   原生 Claude   — base_url 留空，复用本机已登录的 Claude Code（OAuth / ANTHROPIC_API_KEY）
+#   第三方模型    — 设 claude.base_url + api_key + model 指向各家 Anthropic 兼容端点（GLM / DeepSeek...）
+# 关键隔离（见 README）：
+#   - 强制在 mktemp 空目录里运行 → 阻断 cwd 向上的项目 CLAUDE.md 注入
+#   - 第三方路径用全新空 config_dir → 连全局 CLAUDE.md + 残留登录态一并隔离
+#   - 禁全部 agentic 工具（-p 默认拒权 + --disallowedTools 兜底）→ 单发纯文本裁决，递归结构上不可能
+call_claude_agent() {
+    local prompt="$1"
+    local max_attempts
+    max_attempts=$(_agent_attempts)
+    local result=""
+
+    check_claude || return 1
+
+    local model base_url api_key config_dir use_proxy extra_args
+    model=$(_config_get claude.model)
+    base_url=$(_config_get claude.base_url)
+    api_key=$(_config_get claude.api_key)
+    config_dir=$(_config_get claude.config_dir)
+    use_proxy=$(_config_get claude.use_proxy)
+    extra_args=$(_config_get claude.extra_args)
+
+    # ── 隔离 config dir ──
+    local ephemeral_cfg=""
+    if [[ -n "$config_dir" ]]; then
+        :                                       # 用户显式指定（如预登录的干净目录）
+    elif [[ -n "$base_url" ]]; then
+        # 第三方路径：env token 鉴权，不依赖登录态 → 全新空目录（内无 .credentials.json）
+        config_dir=$(mktemp -d "${TMPDIR:-/tmp}/sparring-claude-cfg.XXXXXX")
+        ephemeral_cfg="$config_dir"
+    else
+        config_dir="$HOME/.claude"              # 原生路径：复用用户登录态
+    fi
+    # 强制空 cwd（杀 cwd 向上的项目 CLAUDE.md，对两条路径都生效）
+    local run_cwd
+    run_cwd=$(mktemp -d "${TMPDIR:-/tmp}/sparring-claude-cwd.XXXXXX")
+
+    local prompt_file output_file log_file
+    prompt_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-prompt.XXXXXX")
+    output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-out.XXXXXX")
+    log_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-log.XXXXXX")
+
+    cat > "$prompt_file" <<EOF
+你在 Dual AI Workflow 中担任严格 reviewer。
+
+响应格式必须严格二选一：
+1) 通过时：
+APPROVE
+
+[1-2 句理由]
+
+2) 有问题时：
+CONCERNS
+
+1. [问题 + 影响 + 修复建议]
+2. ...
+
+始终用中文，且不要输出其他格式。
+
+${prompt}
+EOF
+
+    # ── 组装 env ──
+    local -a envs=("CLAUDE_CONFIG_DIR=$config_dir")
+    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+    if [[ -n "$base_url" ]]; then               # 第三方模型路径
+        envs+=("ANTHROPIC_BASE_URL=$base_url")
+        envs+=("ANTHROPIC_AUTH_TOKEN=$api_key")
+        envs+=("ANTHROPIC_API_KEY=")            # 清空 env 残留；叠加全新空 config dir(无 .credentials) 双保险
+        [[ -n "$model" ]] && envs+=("ANTHROPIC_MODEL=$model")
+    fi
+
+    # ── 命令：纯文本单发，禁全部 agentic 工具 ──
+    # 主防线：-p 不带 --dangerously-skip-permissions → 需授权工具自动拒绝（前向兼容，新工具默认挡）
+    # 兜底：--disallowedTools 显式列出当前工具
+    local -a claude_cmd=(claude -p --output-format text)
+    [[ -n "$model" ]] && claude_cmd+=(--model "$model")
+    claude_cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task")
+    # shellcheck disable=SC2206
+    [[ -n "$extra_args" ]] && claude_cmd+=($extra_args)
+
+    local model_desc="${model:-default(已登录账号)}"
+    local route_desc="原生 Claude"
+    [[ -n "$base_url" ]] && route_desc="第三方端点 ${base_url}"
+    echo -e "${DIM}  使用 Claude Code | 模型: ${model_desc} | 路由: ${route_desc}${NC}" >&2
+    echo -e "${DIM}  CLAUDE_CONFIG_DIR: ${config_dir}${NC}" >&2
+
+    # 清理：每个 return 前显式 rm（mirror codex/glm）。不用 trap RETURN ——
+    # 本函数在 result=$(_call_backend ...) 子 shell 里跑且脚本 set -u；RETURN trap 是全局状态，
+    # 会在外层 _call_backend/call_reviewer 返回时再次触发，那里 $_cleanup 未定义 → unbound variable。
+    # 也不用 EXIT trap（见 line 309）。_timeout_cmd 超时是 SIGKILL 子进程 claude，本函数仍正常走到下方清理。
+    local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\"; rm -rf \"$run_cwd\""
+    [[ -n "$ephemeral_cfg" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cfg\""
+
+    local i
+    for i in $(seq 1 $max_attempts); do
+        if ( cd "$run_cwd" && _timeout_cmd "$(_agent_timeout)" \
+                env "${envs[@]}" "${claude_cmd[@]}" \
+                < "$prompt_file" > "$output_file" 2>"$log_file" ); then
+            break
+        fi
+
+        if [[ $i -lt $max_attempts ]]; then
+            echo -e "${DIM}  claude 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
+            sleep 2
+        else
+            local err_output
+            err_output=$(cat "$log_file" 2>/dev/null | tail -c 400 || true)
+            eval "$_cleanup"
+            echo -e "${RED}错误: claude 调用失败 (共 $max_attempts 次尝试)${NC}" >&2
+            [[ -n "$err_output" ]] && echo -e "${DIM}  错误信息: $err_output${NC}" >&2
+            return 1
+        fi
+    done
+
+    result=$(cat "$output_file" 2>/dev/null || true)
+    eval "$_cleanup"
+
+    if [[ -z "${result//[[:space:]]/}" ]]; then
+        echo -e "${RED}错误: claude 返回空结果${NC}" >&2
+        return 1
+    fi
+
+    echo "$result"
+}
+
 # 底层：调用指定 backend
 _call_backend() {
     local backend="$1"
@@ -1152,6 +1311,7 @@ _call_backend() {
         cursor) call_cursor_agent "$prompt" "$task_dir" ;;
         codex)  call_codex_agent "$prompt" "$task_dir" ;;
         glm)    call_glm_agent "$prompt" "$task_dir" ;;
+        claude) call_claude_agent "$prompt" "$task_dir" ;;
         *)      echo -e "${RED}错误: 不支持的 reviewer backend: ${backend}${NC}" >&2; return 1 ;;
     esac
 }
@@ -2600,6 +2760,100 @@ _verify_glm() {
     return 1
 }
 
+_verify_claude() {
+    echo -n "claude CLI: "
+    if command -v claude &>/dev/null; then
+        echo -e "${GREEN}✓ $(command claude --version 2>/dev/null | head -1)${NC}"
+    else
+        echo -e "${RED}✗ 未安装${NC}"
+        echo -e "${DIM}  npm install -g @anthropic-ai/claude-code${NC}"
+        return 1
+    fi
+
+    local model base_url api_key config_dir use_proxy
+    model=$(_config_get claude.model)
+    base_url=$(_config_get claude.base_url)
+    api_key=$(_config_get claude.api_key)
+    config_dir=$(_config_get claude.config_dir)
+    use_proxy=$(_config_get claude.use_proxy)
+
+    local route="原生 Claude（本机登录态）"
+    if [[ -n "$base_url" ]]; then
+        route="第三方端点 ${base_url}"
+        echo -n "claude.api_key: "
+        if [[ -z "$api_key" ]]; then
+            echo -e "${RED}✗ 未配置（配了 base_url 必须配 api_key）${NC}"
+            echo -e "${DIM}  sparring config init  或  export SPARRING_CLAUDE_API_KEY=<token>${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}✓ ${api_key:0:4}***${api_key: -4}${NC}"
+    fi
+    echo -e "  路由: ${route}"
+    echo -e "  模型: ${model:-default(已登录账号)}"
+    echo -e "  代理: $([[ "$use_proxy" == "true" ]] && echo "保留" || echo "已清空")"
+
+    # 原生路径：全局 CLAUDE.md 会被加载 → 提示用 config_dir 隔离
+    if [[ -z "$base_url" && -z "$config_dir" && -f "$HOME/.claude/CLAUDE.md" ]]; then
+        echo -e "${YELLOW}  ⚠ 检测到 ~/.claude/CLAUDE.md，原生路径下会被注入 reviewer 上下文${NC}"
+        echo -e "${DIM}    递归已被禁工具阻断；如需彻底隔离，设 claude.config_dir 指向一个已登录但无 CLAUDE.md 的目录${NC}"
+    fi
+
+    echo -n "  连通性: "
+    local out err_file ephemeral_cfg="" run_cwd vcfg
+    err_file=$(mktemp "${TMPDIR:-/tmp}/workflow-verify-claude-log.XXXXXX")
+    run_cwd=$(mktemp -d "${TMPDIR:-/tmp}/sparring-verify-cwd.XXXXXX")
+    if [[ -n "$config_dir" ]]; then
+        vcfg="$config_dir"
+    elif [[ -n "$base_url" ]]; then
+        vcfg=$(mktemp -d "${TMPDIR:-/tmp}/sparring-verify-cfg.XXXXXX")
+        ephemeral_cfg="$vcfg"
+    else
+        vcfg="$HOME/.claude"
+    fi
+
+    local -a envs=("CLAUDE_CONFIG_DIR=$vcfg")
+    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+    if [[ -n "$base_url" ]]; then
+        envs+=("ANTHROPIC_BASE_URL=$base_url" "ANTHROPIC_AUTH_TOKEN=$api_key" "ANTHROPIC_API_KEY=")
+        [[ -n "$model" ]] && envs+=("ANTHROPIC_MODEL=$model")
+    fi
+    local -a vcmd=(claude -p --output-format text)
+    [[ -n "$model" ]] && vcmd+=(--model "$model")
+    vcmd+=(--disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task")
+
+    # 清理：显式 rm（理由同 call_claude_agent，不用 trap）
+    local _vclean="rm -f \"$err_file\"; rm -rf \"$run_cwd\""
+    [[ -n "$ephemeral_cfg" ]] && _vclean="$_vclean; rm -rf \"$ephemeral_cfg\""
+
+    if out=$( cd "$run_cwd" && _timeout_cmd 60 env "${envs[@]}" "${vcmd[@]}" \
+                <<< "Reply with only: OK" 2>"$err_file" ); then
+        if echo "$out" | grep -qi "OK"; then
+            echo -e "${GREEN}✓ 正常${NC}"
+        else
+            echo -e "${YELLOW}? 有响应但内容异常: ${out:0:80}${NC}"
+        fi
+        eval "$_vclean"
+        return 0
+    fi
+
+    local err_summary hint
+    err_summary=$(grep -vE '^$' "$err_file" 2>/dev/null | head -1 | cut -c1-120)
+    if echo "$err_summary" | grep -qi 'unauthor\|401\|invalid.*key\|authentication'; then
+        hint="检查 claude.api_key / 端点鉴权方式（第三方端点用 token）"
+    elif echo "$err_summary" | grep -qi 'not found\|command not found\|enoent'; then
+        hint="npm install -g @anthropic-ai/claude-code"
+    elif echo "$err_summary" | grep -qi 'timeout\|timed out'; then
+        hint="调大 SPARRING_REVIEW_TIMEOUT 或检查网络/代理（国产端点别走代理）"
+    else
+        hint="原生路径确认已 claude login；第三方路径确认 base_url/api_key/model 正确"
+    fi
+    eval "$_vclean"
+    echo -e "${RED}✗ 连接失败${NC}"
+    [[ -n "$err_summary" ]] && echo -e "${DIM}  错误: ${err_summary}${NC}"
+    echo -e "${YELLOW}  提示: ${hint}${NC}"
+    return 1
+}
+
 _verify_backend() {
     local role="$1"
     local backend="$2"
@@ -2611,6 +2865,7 @@ _verify_backend() {
         cursor) _verify_cursor; return $? ;;
         codex)  _verify_codex; return $? ;;
         glm)    _verify_glm; return $? ;;
+        claude) _verify_claude; return $? ;;
     esac
 }
 
@@ -2679,7 +2934,7 @@ _validate_backend_env() {
         val="${!var:-}"
         [[ -z "$val" ]] && continue
         if ! _normalize_backend "$val" >/dev/null 2>&1; then
-            echo -e "${RED}错误: ${var}='${val}' 不是合法 backend（仅支持 cursor / codex / glm）${NC}" >&2
+            echo -e "${RED}错误: ${var}='${val}' 不是合法 backend（仅支持 cursor / codex / glm / claude）${NC}" >&2
             exit 1
         fi
     done
@@ -2815,6 +3070,9 @@ ${YELLOW}环境变量（可覆盖 config.json 任意字段）:${NC}
     SPARRING_GLM_API_KEY=xxx.yyy    对应 glm.api_key
     SPARRING_REVIEW_FALLBACK=glm    对应 review.fallback
     SPARRING_REVIEW_TIMEOUT=120     对应 review.timeout
+    SPARRING_CLAUDE_BASE_URL=...    对应 claude.base_url（Claude Code 跑第三方模型时设）
+    SPARRING_CLAUDE_API_KEY=...     对应 claude.api_key（第三方端点 token）
+    SPARRING_CLAUDE_MODEL=glm-5.2   对应 claude.model
 
   ${DIM}历史兼容（仍生效）:${NC}
     WORKFLOW_REVIEW_BACKEND_FALLBACK → review.fallback
