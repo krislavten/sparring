@@ -387,6 +387,19 @@ _workflow_legacy_alias() {
 PLANS_DIR="${WORKFLOW_DIR}/plans"
 REVIEW_JOBS_DIR="${WORKFLOW_DIR}/review-jobs"
 
+# ─── Review 约定 (.sparring/REVIEW.md) ──────────────────────
+# 查找顺序：项目级 → 全局 → 空字符串
+# 注入到所有 reviewer prompt 中（diff 模式内联；agent 模式通过 --add-dir 也能自行读取）
+load_review_conventions() {
+    local project_file="${CONFIG_DIR_PROJECT}/REVIEW.md"
+    local global_file="${CONFIG_DIR_GLOBAL}/REVIEW.md"
+    if [[ -f "$project_file" ]]; then
+        cat "$project_file"
+    elif [[ -f "$global_file" ]]; then
+        cat "$global_file"
+    fi
+}
+
 # ─── 输入验证 ───────────────────────────────────────────────
 
 validate_task_name() {
@@ -1422,6 +1435,10 @@ USAGE
         content="【审查主题】${title}"$'\n\n'"$content"
     fi
 
+    local conventions
+    conventions=$(load_review_conventions)
+    [[ -n "$conventions" ]] && content="$content"$'\n\n## Review 约定\n'"$conventions"
+
     local result rc=0
     result=$(call_reviewer "$content" "") || rc=$?
     if [[ $rc -ne 0 ]]; then
@@ -1610,12 +1627,17 @@ review_proposal() {
     local proposal_content
     proposal_content=$(cat "${task_dir}/proposal.md")
 
+    local conventions
+    conventions=$(load_review_conventions)
+    local conventions_section=""
+    [[ -n "$conventions" ]] && conventions_section=$'\n\n## Review 约定\n'"$conventions"
+
     local prompt="你正在 review 一份技术方案。
 
 任务: $(jq -r '.task_name' "${task_dir}/meta.json")
 
 方案内容:
-${proposal_content}
+${proposal_content}${conventions_section}
 
 请 review 并回复:
 - APPROVE: 如果方案合理可行
@@ -1741,12 +1763,17 @@ review_code() {
         return 1
     fi
 
+    local conventions
+    conventions=$(load_review_conventions)
+    local conventions_section=""
+    [[ -n "$conventions" ]] && conventions_section=$'\n\n## Review 约定\n'"$conventions"
+
     local prompt="你正在 review 代码实现。
 
 任务: $(jq -r '.task_name' "${task_dir}/meta.json")
 
 代码改动:
-${diff_content}
+${diff_content}${conventions_section}
 
 请 review 并回复:
 - APPROVE: 如果代码质量良好
