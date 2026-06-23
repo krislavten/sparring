@@ -1288,6 +1288,180 @@ test_resolve_script_dir_via_symlink() {
 }
 test_resolve_script_dir_via_symlink
 
+echo ""
+echo "=== find_project_root (worktree 支持) ==="
+
+test_find_project_root_in_git_repo() {
+    source_workflow_funcs
+    local fake_repo="$TMP_DIR/fake-repo"
+    mkdir -p "$fake_repo/sub/deep"
+    git -C "$fake_repo" init -q
+    git -C "$fake_repo" commit --allow-empty -m "init" -q 2>/dev/null || true
+
+    # macOS $TMPDIR is a symlink (/var/folders → /private/var/folders); resolve both sides
+    local real_repo root real_root
+    real_repo=$(cd "$fake_repo" && pwd -P)
+    root=$(cd "$fake_repo/sub/deep" && find_project_root 2>/dev/null)
+    real_root=$(cd "$root" && pwd -P)
+    assert_eq "git 子目录能找到 repo 根" "$real_repo" "$real_root"
+}
+test_find_project_root_in_git_repo
+
+test_find_project_root_workflow_fallback() {
+    source_workflow_funcs
+    # 非 git 目录，有 .workflow → fallback 到 .workflow 检测
+    local non_git_dir="$TMP_DIR/not-a-repo"
+    mkdir -p "$non_git_dir/.workflow"
+
+    local root
+    root=$(cd "$non_git_dir" && find_project_root 2>/dev/null)
+    assert_eq ".workflow fallback 在非 git 目录生效" "$non_git_dir" "$root"
+}
+test_find_project_root_workflow_fallback
+
+echo ""
+echo "=== load_review_conventions ==="
+
+test_load_review_conventions_none() {
+    source_workflow_funcs
+    local result
+    result=$(load_review_conventions 2>/dev/null)
+    assert_eq "项目/全局均无 REVIEW.md 时返回空" "" "$result"
+}
+test_load_review_conventions_none
+
+test_load_review_conventions_project_level() {
+    source_workflow_funcs
+    mkdir -p "$CONFIG_DIR_PROJECT"
+    printf '# 项目约定\n- 必须覆盖边界 case\n' > "$CONFIG_DIR_PROJECT/REVIEW.md"
+
+    local result
+    result=$(load_review_conventions 2>/dev/null)
+    assert_contains "读到项目级 REVIEW.md" "项目约定" "$result"
+}
+test_load_review_conventions_project_level
+
+test_load_review_conventions_global_fallback() {
+    source_workflow_funcs
+    rm -f "$CONFIG_DIR_PROJECT/REVIEW.md"   # 清掉上一个测试残留
+    mkdir -p "$CONFIG_DIR_GLOBAL"
+    printf '全局默认约定\n' > "$CONFIG_DIR_GLOBAL/REVIEW.md"
+
+    local result
+    result=$(load_review_conventions 2>/dev/null)
+    assert_contains "无项目级时回退到全局 REVIEW.md" "全局默认约定" "$result"
+}
+test_load_review_conventions_global_fallback
+
+test_load_review_conventions_project_wins() {
+    source_workflow_funcs
+    mkdir -p "$CONFIG_DIR_PROJECT" "$CONFIG_DIR_GLOBAL"
+    printf '项目约定\n' > "$CONFIG_DIR_PROJECT/REVIEW.md"
+    printf '全局约定\n' > "$CONFIG_DIR_GLOBAL/REVIEW.md"
+
+    local result
+    result=$(load_review_conventions 2>/dev/null)
+    assert_contains "项目级 REVIEW.md 优先于全局" "项目约定" "$result"
+    if echo "$result" | grep -q "全局约定"; then
+        echo "  ✗ 全局内容不应出现"
+        ((FAIL++))
+    else
+        echo "  ✓ 全局内容未混入"
+        ((PASS++))
+    fi
+}
+test_load_review_conventions_project_wins
+
+echo ""
+echo "=== claude.mode=agent 命令组装 ==="
+
+# mock claude 扩展版：额外 dump --add-dir 和 --disallowedTools 的值
+_make_mock_claude_v2() {
+    local dir="$TMP_DIR/mock-claude-v2-$RANDOM"
+    mkdir -p "$dir"
+    cat > "$dir/claude" <<'MOCK'
+#!/bin/bash
+ARGV_NL=$(printf '%s\n' "$@")
+{
+  echo "PWD: $PWD"
+  echo "HAS_PRINT: $(echo "$ARGV_NL" | grep -qx -- '-p' && echo yes || echo no)"
+  echo "HAS_DISALLOWED: $(echo "$ARGV_NL" | grep -qx -- '--disallowedTools' && echo yes || echo no)"
+  echo "DISALLOWED_VAL: $(echo "$ARGV_NL" | grep -A1 -x -- '--disallowedTools' | tail -1)"
+  echo "HAS_ADD_DIR: $(echo "$ARGV_NL" | grep -qx -- '--add-dir' && echo yes || echo no)"
+  echo "ADD_DIR_VAL: $(echo "$ARGV_NL" | grep -A1 -x -- '--add-dir' | tail -1)"
+} > "$CLAUDE_MOCK_DUMP"
+cat > /dev/null 2>&1 || true
+echo "APPROVE"
+echo "mock ok"
+MOCK
+    chmod +x "$dir/claude"
+    echo "$dir"
+}
+
+test_claude_diff_mode_no_add_dir() {
+    source_workflow_funcs
+    local mockdir dump
+    mockdir=$(_make_mock_claude_v2)
+    export CLAUDE_MOCK_DUMP="$TMP_DIR/dump-diff-mode-$RANDOM.txt"
+
+    PATH="$mockdir:$PATH" call_claude_agent "审查代码" 2>/dev/null
+    dump=$(cat "$CLAUDE_MOCK_DUMP" 2>/dev/null)
+
+    assert_contains "diff 模式无 --add-dir" "HAS_ADD_DIR: no" "$dump"
+    assert_contains "diff 模式有 --disallowedTools" "HAS_DISALLOWED: yes" "$dump"
+    assert_contains "diff 模式 Read 在 disallowed 中" "Read" \
+        "$(echo "$dump" | grep DISALLOWED_VAL)"
+    unset CLAUDE_MOCK_DUMP
+}
+test_claude_diff_mode_no_add_dir
+
+test_claude_agent_mode_has_add_dir() {
+    source_workflow_funcs
+    local mockdir dump
+    mockdir=$(_make_mock_claude_v2)
+    export CLAUDE_MOCK_DUMP="$TMP_DIR/dump-agent-mode-$RANDOM.txt"
+
+    PATH="$mockdir:$PATH" SPARRING_CLAUDE_MODE=agent \
+        call_claude_agent "审查代码" 2>/dev/null
+    dump=$(cat "$CLAUDE_MOCK_DUMP" 2>/dev/null)
+
+    assert_contains "agent 模式有 --add-dir" "HAS_ADD_DIR: yes" "$dump"
+    assert_contains "agent 模式 --add-dir 指向 PROJECT_ROOT" "$PROJECT_ROOT" \
+        "$(echo "$dump" | grep ADD_DIR_VAL)"
+    local disallowed_val
+    disallowed_val=$(echo "$dump" | grep DISALLOWED_VAL | sed 's/DISALLOWED_VAL: //')
+    if echo "$disallowed_val" | grep -q "\bRead\b"; then
+        echo "  ✗ agent 模式不应在 disallowedTools 中禁 Read"
+        ((FAIL++))
+    else
+        echo "  ✓ agent 模式 Read 未被禁用"
+        ((PASS++))
+    fi
+    assert_contains "agent 模式 Edit 仍被禁" "Edit" "$disallowed_val"
+    assert_contains "agent 模式 Write 仍被禁" "Write" "$disallowed_val"
+    unset CLAUDE_MOCK_DUMP
+}
+test_claude_agent_mode_has_add_dir
+
+test_claude_agent_mode_downgrade_with_base_url() {
+    source_workflow_funcs
+    local mockdir dump
+    mockdir=$(_make_mock_claude_v2)
+    export CLAUDE_MOCK_DUMP="$TMP_DIR/dump-downgrade-$RANDOM.txt"
+
+    # agent 模式 + base_url → 自动降级到 diff 模式
+    PATH="$mockdir:$PATH" \
+        SPARRING_CLAUDE_MODE=agent \
+        SPARRING_CLAUDE_BASE_URL="https://x.test/anthropic" \
+        SPARRING_CLAUDE_API_KEY="tok-test" \
+        call_claude_agent "审查代码" 2>/dev/null
+    dump=$(cat "$CLAUDE_MOCK_DUMP" 2>/dev/null)
+
+    assert_contains "base_url 时 agent 模式降级，无 --add-dir" "HAS_ADD_DIR: no" "$dump"
+    unset CLAUDE_MOCK_DUMP
+}
+test_claude_agent_mode_downgrade_with_base_url
+
 # ─── Summary ─────────────────────────────────────────────────
 
 echo ""
