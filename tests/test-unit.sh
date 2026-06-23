@@ -1299,10 +1299,11 @@ test_find_project_root_in_git_repo() {
     git -C "$fake_repo" commit --allow-empty -m "init" -q 2>/dev/null || true
 
     # macOS $TMPDIR is a symlink (/var/folders → /private/var/folders); resolve both sides
-    local real_repo root
+    local real_repo root real_root
     real_repo=$(cd "$fake_repo" && pwd -P)
     root=$(cd "$fake_repo/sub/deep" && find_project_root 2>/dev/null)
-    assert_eq "git 子目录能找到 repo 根" "$real_repo" "$root"
+    real_root=$(cd "$root" && pwd -P)
+    assert_eq "git 子目录能找到 repo 根" "$real_repo" "$real_root"
 }
 test_find_project_root_in_git_repo
 

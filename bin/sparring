@@ -220,19 +220,15 @@ check_claude() {
 
 find_project_root() {
     local dir="$PWD"
-    # git rev-parse works in both normal repos and worktrees (.git is a file in worktrees,
-    # so [[ -d .git ]] would fail — git rev-parse handles both correctly)
-    local git_root
-    if git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
-        echo "$git_root"
-        return 0
-    fi
+    # Walk up preferring .workflow (sparring project root) over bare git root.
+    # Check [[ -e .git ]] instead of [[ -d .git ]] so git worktrees are detected:
+    # in a worktree .git is a file (gitdir pointer), not a directory.
     while [[ "$dir" != "/" ]]; do
         if [[ -d "$dir/.workflow" ]]; then
             echo "$dir"
             return 0
         fi
-        if [[ -d "$dir/.git" ]]; then
+        if [[ -e "$dir/.git" ]]; then
             echo "$dir"
             return 0
         fi
@@ -1208,13 +1204,14 @@ ${prompt}"
 #   第三方模型    — 设 claude.base_url + api_key + model 指向各家 Anthropic 兼容端点（GLM / DeepSeek...）
 # 两种模式（claude.mode）：
 #   diff  （默认）— 禁全部工具，prompt 含静态 diff 文本；任何 base_url 端点均可用
-#   agent          — 开放只读工具（Read/Grep/Glob/Bash）+ --add-dir 挂载 PROJECT_ROOT；
-#                    reviewer 自主探索仓库上下文；仅原生 claude CLI 支持（base_url 设置时自动降级 diff）
+#   agent          — 开放只读工具（Read/Grep/Glob）+ --add-dir 挂载 PROJECT_ROOT；
+#                    reviewer 自主探索仓库文件上下文；Bash 仍禁用（防 prompt injection）；
+#                    仅原生 claude CLI 支持（base_url 设置时自动降级 diff）
 # 关键隔离：
 #   - 强制在 mktemp 空目录里运行 → 阻断 cwd 向上的项目 CLAUDE.md 注入
 #   - 第三方路径用全新空 config_dir → 连全局 CLAUDE.md + 残留登录态一并隔离
 #   - diff 模式禁全部 agentic 工具 → 单发纯文本裁决，递归结构上不可能
-#   - agent 模式仅禁写类工具（Edit/Write/NotebookEdit/Task/WebFetch/WebSearch）
+#   - agent 模式禁写类工具 + Bash（Edit/Write/NotebookEdit/Task/WebFetch/WebSearch/Bash）
 #   - agent 模式失败时自动降级到 diff 模式重试一次
 call_claude_agent() {
     local prompt="$1"
@@ -1309,9 +1306,11 @@ EOF
         [[ -n "$model" ]] && cmd+=(--model "$model")
 
         if [[ "$eff_mode" == "agent" ]]; then
-            # 开放只读工具，挂载 PROJECT_ROOT 供探索；写类工具全禁
+            # 开放只读工具（Read/Grep/Glob），挂载 PROJECT_ROOT 供探索。
+            # Bash 显式禁用：reviewer 不需要执行命令，且禁 Bash 可防止 diff 内
+            # prompt injection 借 Bash 执行任意系统命令（rm/curl 等）。
             cmd+=(--add-dir "$PROJECT_ROOT")
-            cmd+=(--disallowedTools "Edit Write NotebookEdit Task WebFetch WebSearch")
+            cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Task WebFetch WebSearch")
         else
             # diff 模式：禁全部 agentic 工具，纯文本单发
             # 主防线：-p 不带 --dangerously-skip-permissions → 新工具默认挡
