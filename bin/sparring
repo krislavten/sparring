@@ -212,6 +212,13 @@ check_claude() {
 
 find_project_root() {
     local dir="$PWD"
+    # git rev-parse works in both normal repos and worktrees (.git is a file in worktrees,
+    # so [[ -d .git ]] would fail — git rev-parse handles both correctly)
+    local git_root
+    if git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+        echo "$git_root"
+        return 0
+    fi
     while [[ "$dir" != "/" ]]; do
         if [[ -d "$dir/.workflow" ]]; then
             echo "$dir"
