@@ -242,7 +242,7 @@ sparring config get glm.api_key   # 取单值（敏感字段掩码）
   "review": {
     "backend": "cursor",
     "fallback": "glm",
-    "timeout": 60,
+    "timeout": 120,
     "retries": 1
   },
   "glm": {
@@ -257,7 +257,7 @@ sparring config get glm.api_key   # 取单值（敏感字段掩码）
 ```json
 {
   "review": {
-    "timeout": 60,
+    "timeout": 120,
     "retries": 1
   }
 }
@@ -270,10 +270,14 @@ sparring config get glm.api_key   # 取单值（敏感字段掩码）
 ```bash
 export SPARRING_REVIEW_BACKEND=glm       # → review.backend
 export SPARRING_GLM_API_KEY=<id.secret>  # → glm.api_key
-export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
+export SPARRING_REVIEW_TIMEOUT=180       # → review.timeout（示例：临时手动调更大；默认起始值已是 120，一般不需要手动设）
 ```
 
 > 💡 **API key 默认放全局 config 即可，不依赖任何环境变量。** `sparring config init` 生成 `~/.config/sparring/config.json`（chmod 600），填入 `glm.api_key` 后所有命令（含 `sparring review`、`review-code` 等）自动读取，新机器/新用户也只需各自 init 一次。`SPARRING_GLM_API_KEY` 环境变量仅作可选临时覆盖（如 CI / 临时换 key），**不是必需**。
+
+> ⏱️ **大 diff 超时自适应**：`review.timeout` 只是单次调用超时的起始值（默认 120s）。实际单次调用超时会按送审内容大小自动加时——每 10000 字节 +30s，最多加 480s（单次封顶 600s），大改动 / 大 diff 不再需要手动调大 `SPARRING_REVIEW_TIMEOUT` 才能跑完。
+>
+> ⚠️ **重试会线性放大最坏等待时间**：失败重试时每次都会用满同一个（已自适应加时的）单次超时，不会缩水。默认 `review.retries=1`（共尝试 2 次），大 diff 单次超时封顶 600s 时，最坏情况下一次 `sparring review` 可能等待到 **1200s（20 分钟）** 才报错。这是有意为之——重试是为了应对网络抖动/瞬时错误，缩短重试预算只会让大 diff 的重试必然失败。如果不想等这么久，可以设 `review.retries=0` 关闭重试，或结合铁律里"reviewer 卡住"的判断自行决定何时放弃等待。
 
 ### 可配置字段
 
@@ -281,7 +285,7 @@ export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
 |---|---|---|
 | `review.backend` | `cursor` | 主后端：`cursor` / `codex` / `glm` / `claude` |
 | `review.fallback` | `null` | 备后端（可选） |
-| `review.timeout` | `60` | 单次调用超时秒数 |
+| `review.timeout` | `120` | 单次调用超时秒数起始值（会按内容大小再自适应加时，见上） |
 | `review.retries` | `1` | 失败后重试次数（共尝试 retries+1 次） |
 | `cursor.model` | 读 `agents/cursor.md` | Cursor 模型 |
 | `codex.model` | 读 codex config | Codex 模型 |

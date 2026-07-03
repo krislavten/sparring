@@ -27,6 +27,26 @@ _agent_attempts() {
 }
 # 兼容访问器（延迟求值，读当前 config）
 _agent_timeout() { _config_get review.timeout; }
+# 按送审内容大小自适应加时：内容越大（尤其大 diff），reviewer（推理模型）需要的时间越长，
+# 固定超时在大改动时很容易被打断（HTTP 000 / 调用错误）。以 review.timeout 为底，
+# 每 10000 字节内容加 30s，最多加 480s（默认配置下总上限 10 分钟）。
+# 不传内容时退化为纯配置值，兼容原有无参调用方（如 verify 展示）。
+ADAPTIVE_TIMEOUT_STEP_BYTES=10000
+ADAPTIVE_TIMEOUT_STEP_SECONDS=30
+ADAPTIVE_TIMEOUT_MAX_EXTRA=480
+_adaptive_timeout() {
+    local content="${1:-}"
+    local base
+    base=$(_agent_timeout)
+    [[ -z "$content" ]] && { echo "$base"; return; }
+
+    local bytes extra
+    bytes=$(printf '%s' "$content" | wc -c | tr -d ' ')
+    extra=$(( (bytes / ADAPTIVE_TIMEOUT_STEP_BYTES) * ADAPTIVE_TIMEOUT_STEP_SECONDS ))
+    [[ $extra -gt $ADAPTIVE_TIMEOUT_MAX_EXTRA ]] && extra=$ADAPTIVE_TIMEOUT_MAX_EXTRA
+
+    echo $(( base + extra ))
+}
 # Resolve symlink to find real script location
 _resolve_script_dir() {
     local src="$0"
@@ -247,7 +267,7 @@ _config_defaults() {
   "review": {
     "backend": "cursor",
     "fallback": null,
-    "timeout": 60,
+    "timeout": 120,
     "retries": 1
   },
   "cursor": {
@@ -953,10 +973,10 @@ ${prompt}"
 
     for i in $(seq 1 $max_attempts); do
         if [[ ${#resume_args[@]} -gt 0 ]]; then
-            result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_agent_timeout)" \
+            result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_adaptive_timeout "$prompt")" \
                 agent --print --trust --model "$model" "${resume_args[@]}" "$prompt" 2>&1) && break
         else
-            result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_agent_timeout)" \
+            result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_adaptive_timeout "$prompt")" \
                 agent --print --trust --model "$model" "$prompt" 2>&1) && break
         fi
 
@@ -1031,7 +1051,7 @@ EOF
     echo -e "${DIM}  CODEX_HOME: ${codex_home}${NC}" >&2
 
     for i in $(seq 1 $max_attempts); do
-        if HTTP_PROXY= HTTPS_PROXY= CODEX_HOME="$codex_home" _timeout_cmd "$(_agent_timeout)" \
+        if HTTP_PROXY= HTTPS_PROXY= CODEX_HOME="$codex_home" _timeout_cmd "$(_adaptive_timeout "$prompt")" \
             "${codex_cmd[@]}" < "$prompt_file" > "$command_output_file" 2>&1; then
             break
         fi
@@ -1125,11 +1145,14 @@ ${prompt}"
     local http_status=""
     local result=""
 
+    local call_timeout
+    call_timeout=$(_adaptive_timeout "$full_prompt")
+
     for i in $(seq 1 $max_attempts); do
-        http_status=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_agent_timeout)" \
+        http_status=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$call_timeout" \
             curl -sS -w '%{http_code}' -o "$response_file" \
                 --connect-timeout 10 \
-                --max-time "$(_agent_timeout)" \
+                --max-time "$call_timeout" \
                 -X POST "${api_base}/chat/completions" \
                 -H "Content-Type: application/json" \
                 -H "Authorization: Bearer ${api_key}" \
@@ -1271,7 +1294,7 @@ EOF
 
     local i
     for i in $(seq 1 $max_attempts); do
-        if ( cd "$run_cwd" && _timeout_cmd "$(_agent_timeout)" \
+        if ( cd "$run_cwd" && _timeout_cmd "$(_adaptive_timeout "$prompt")" \
                 env "${envs[@]}" "${claude_cmd[@]}" \
                 < "$prompt_file" > "$output_file" 2>"$log_file" ); then
             break
@@ -2480,7 +2503,7 @@ config_init() {
 {
   "_comment": "项目级 Sparring 配置（团队共享，入库）。只放团队需要统一的非主观项（如 review.timeout / retries）。用什么 reviewer 后端和模型由各开发者的全局配置 (~/.config/sparring/config.json) 决定 —— 项目级不要设 review.backend / fallback / *.model，写了会覆盖每个人的个人选择。切勿填 api_key（放全局 config 或 SPARRING_GLM_API_KEY 环境变量）。",
   "review": {
-    "timeout": 60,
+    "timeout": 120,
     "retries": 1
   }
 }
@@ -2514,7 +2537,7 @@ EOF
   "review": {
     "backend": "cursor",
     "fallback": "glm",
-    "timeout": 60,
+    "timeout": 120,
     "retries": 1
   },
   "glm": {
@@ -2887,7 +2910,11 @@ verify() {
     fi
 
     echo -n "超时: "
-    echo -e "${GREEN}$(_agent_timeout)s${NC}  重试次数: $(_config_get review.retries) (共 $(_agent_attempts) 次尝试)"
+    local _verify_base _verify_attempts _verify_worst
+    _verify_base=$(_agent_timeout)
+    _verify_attempts=$(_agent_attempts)
+    _verify_worst=$(( (_verify_base + ADAPTIVE_TIMEOUT_MAX_EXTRA) * _verify_attempts ))
+    echo -e "${GREEN}${_verify_base}s${NC} 起（按内容大小自适应加时，单次最多 +${ADAPTIVE_TIMEOUT_MAX_EXTRA}s）  重试次数: $(_config_get review.retries) (共 ${_verify_attempts} 次尝试，最坏总等待 ≈ ${_verify_worst}s)"
 
     _verify_backend "主 backend" "$primary" || ok=false
 
@@ -3069,7 +3096,7 @@ ${YELLOW}环境变量（可覆盖 config.json 任意字段）:${NC}
     SPARRING_REVIEW_BACKEND=glm     对应 review.backend
     SPARRING_GLM_API_KEY=xxx.yyy    对应 glm.api_key
     SPARRING_REVIEW_FALLBACK=glm    对应 review.fallback
-    SPARRING_REVIEW_TIMEOUT=120     对应 review.timeout
+    SPARRING_REVIEW_TIMEOUT=180     对应 review.timeout（示例：临时手动调更大；默认起始值已是 120，一般不需要手动设，见下）
     SPARRING_CLAUDE_BASE_URL=...    对应 claude.base_url（Claude Code 跑第三方模型时设）
     SPARRING_CLAUDE_API_KEY=...     对应 claude.api_key（第三方端点 token）
     SPARRING_CLAUDE_MODEL=glm-5.2   对应 claude.model
@@ -3078,6 +3105,11 @@ ${YELLOW}环境变量（可覆盖 config.json 任意字段）:${NC}
     WORKFLOW_REVIEW_BACKEND_FALLBACK → review.fallback
     WORKFLOW_AGENT_MODEL             → cursor.model
     以及所有 WORKFLOW_* 形式的新 schema 变量
+
+  ${DIM}超时自适应: 单次调用超时 = review.timeout + min(内容字节数/${ADAPTIVE_TIMEOUT_STEP_BYTES}*${ADAPTIVE_TIMEOUT_STEP_SECONDS}s, ${ADAPTIVE_TIMEOUT_MAX_EXTRA}s)。${NC}
+  ${DIM}大 diff / 大改动送审会自动加时，无需手动调大 review.timeout。${NC}
+  ${DIM}⚠ 重试会用满同一个自适应后的单次超时（不缩水）: 最坏总等待 ≈ 单次超时 × (retries+1)，${NC}
+  ${DIM}  大 diff 默认配置下最坏可达 1200s(20min)。想快速失败可设 review.retries=0。${NC}
 
 ${YELLOW}Issue 相关环境变量:${NC}
   WORKFLOW_POLL_INTERVAL  issue 轮询间隔秒数 (默认: ${ISSUE_POLL_INTERVAL})
