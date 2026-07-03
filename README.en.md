@@ -242,7 +242,7 @@ sparring config get glm.api_key   # single value (sensitive fields masked)
   "review": {
     "backend": "cursor",
     "fallback": "glm",
-    "timeout": 60,
+    "timeout": 120,
     "retries": 1
   },
   "glm": {
@@ -270,8 +270,12 @@ sparring config get glm.api_key   # single value (sensitive fields masked)
 ```bash
 export SPARRING_REVIEW_BACKEND=glm       # → review.backend
 export SPARRING_GLM_API_KEY=<id.secret>  # → glm.api_key
-export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
+export SPARRING_REVIEW_TIMEOUT=180       # → review.timeout (example: temporary manual override; default is already 120, usually no need to set this)
 ```
+
+> ⏱️ **Adaptive timeout for large diffs**: `review.timeout` is just the starting value for a single call (default 120s). The actual per-call timeout auto-scales with the size of the reviewed content — +30s per 10,000 bytes, capped at +480s (600s per call) — so large diffs/refactors no longer need a manual `SPARRING_REVIEW_TIMEOUT` bump to complete.
+>
+> ⚠️ **Retries multiply the worst-case wait linearly**: each retry reuses the full (already-adaptive) per-call timeout — it's never shrunk. With the default `review.retries=1` (2 attempts total) and a large diff capped at 600s per call, a single `sparring review` can take up to **1200s (20 min)** before failing. This is intentional — retries exist to absorb transient network errors, and shrinking the retry budget would make retries on large diffs fail by construction. Set `review.retries=0` to disable retries if you'd rather fail fast, or use your own judgment on when to give up waiting.
 
 ### Config reference
 
@@ -279,7 +283,7 @@ export SPARRING_REVIEW_TIMEOUT=120       # → review.timeout
 |---|---|---|
 | `review.backend` | `cursor` | Primary: `cursor` / `codex` / `glm` |
 | `review.fallback` | `null` | Fallback backend (optional) |
-| `review.timeout` | `60` | Per-call timeout (seconds) |
+| `review.timeout` | `120` | Starting per-call timeout in seconds (auto-scales with content size, see above) |
 | `review.retries` | `1` | Retries after failure (total attempts = retries + 1) |
 | `cursor.model` | from `agents/cursor.md` | Cursor Agent model |
 | `codex.model` | from codex config | Codex model |

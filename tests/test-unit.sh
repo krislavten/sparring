@@ -746,9 +746,64 @@ test_config_defaults() {
     backend=$(_config_get review.backend)
     timeout=$(_config_get review.timeout)
     assert_eq "默认 backend=cursor" "cursor" "$backend"
-    assert_eq "默认 timeout=60" "60" "$timeout"
+    assert_eq "默认 timeout=120" "120" "$timeout"
 }
 test_config_defaults
+
+echo ""
+echo "=== _adaptive_timeout 按内容大小自适应加时 ==="
+
+test_adaptive_timeout_no_content() {
+    source_workflow_funcs
+    local t
+    t=$(_adaptive_timeout)
+    assert_eq "不传内容退化为纯配置值" "120" "$t"
+    t=$(_adaptive_timeout "")
+    assert_eq "空内容同样退化为纯配置值" "120" "$t"
+}
+test_adaptive_timeout_no_content
+
+test_adaptive_timeout_small_content_no_extra() {
+    source_workflow_funcs
+    local content t
+    content=$(head -c 5000 /dev/zero | tr '\0' 'a')
+    t=$(_adaptive_timeout "$content")
+    assert_eq "小内容（< 1 个 step）不加时" "120" "$t"
+}
+test_adaptive_timeout_small_content_no_extra
+
+test_adaptive_timeout_scales_with_size() {
+    source_workflow_funcs
+    local content t
+    content=$(head -c 25000 /dev/zero | tr '\0' 'a')
+    t=$(_adaptive_timeout "$content")
+    # 25000 字节 = 2 个 10000 字节 step → +60s → 120+60=180
+    assert_eq "25000 字节内容加时 60s" "180" "$t"
+}
+test_adaptive_timeout_scales_with_size
+
+test_adaptive_timeout_caps_at_max_extra() {
+    source_workflow_funcs
+    local content t
+    content=$(head -c 1000000 /dev/zero | tr '\0' 'a')
+    t=$(_adaptive_timeout "$content")
+    # 加时封顶 480s → 120+480=600，即使内容远超封顶阈值
+    assert_eq "超大内容加时封顶 480s" "600" "$t"
+}
+test_adaptive_timeout_caps_at_max_extra
+
+test_adaptive_timeout_respects_configured_base() {
+    source_workflow_funcs
+    mkdir -p "$CONFIG_DIR_GLOBAL"
+    echo '{"review":{"timeout":45}}' > "$CONFIG_FILE_GLOBAL"
+    local content t
+    content=$(head -c 25000 /dev/zero | tr '\0' 'a')
+    t=$(_adaptive_timeout "$content")
+    # base 改成 45（非默认 120）→ 45+60=105，确认自适应叠加在配置值之上而非硬编码默认值
+    assert_eq "自适应加时叠加在配置覆盖的 base 之上" "105" "$t"
+    rm -f "$CONFIG_FILE_GLOBAL"
+}
+test_adaptive_timeout_respects_configured_base
 
 test_config_global_overrides_default() {
     source_workflow_funcs
