@@ -65,7 +65,7 @@ ISSUE_POLL_INTERVAL="${WORKFLOW_POLL_INTERVAL:-30}"
 ISSUE_LABEL="${WORKFLOW_ISSUE_LABEL:-claude-ok}"
 ISSUE_PROJECT_NUMBER="${WORKFLOW_PROJECT_NUMBER:-}"
 ISSUE_PROJECT_OWNER="${WORKFLOW_PROJECT_OWNER:-}"
-REVIEW_BACKEND_DEFAULT="cursor"
+REVIEW_BACKEND_DEFAULT="glm"
 
 # ─── Reviewer Backend 配置 ───────────────────────────────────
 
@@ -276,7 +276,7 @@ _config_defaults() {
     cat <<'EOF'
 {
   "review": {
-    "backend": "cursor",
+    "backend": "glm",
     "fallback": null,
     "timeout": 120,
     "retries": 1
@@ -2613,10 +2613,10 @@ EOF
         # 全局：含 key 占位符。chmod 600
         cat > "$target" <<'EOF'
 {
-  "_comment": "全局 Sparring 配置。含 API key，已 chmod 600。不要入库。",
+  "_comment": "全局 Sparring 配置。含 API key，已 chmod 600。不要入库。想要主备降级可把 fallback 设成 cursor/codex/claude 之一（claude 依赖本机已登录的 Claude Code CLI，非纯 API key 场景慎用）。",
   "review": {
-    "backend": "cursor",
-    "fallback": "glm",
+    "backend": "glm",
+    "fallback": null,
     "timeout": 120,
     "retries": 1
   },
