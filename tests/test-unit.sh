@@ -87,11 +87,18 @@ source_workflow_funcs() {
                  -e 's/^set -euo pipefail/# set disabled for testing/' \
                  "$WORKFLOW")"
 
-    # source 过程会执行 CONFIG_FILE_* 赋值，覆盖我们上面的 export。再次强制设置
+    # source 过程会执行 CONFIG_FILE_* / PROJECT_ROOT / PLANS_DIR 等赋值，覆盖我们上面的 export
+    # （bin/sparring 顶层 `PROJECT_ROOT="$(find_project_root)"` 会重新往上找 .git，
+    #  在这个仓库里找到的是真实仓库根目录，而不是我们隔离用的 $TMP_DIR/project）。
+    # 再次强制设置，否则 create_task 等测试会把 meta.json 写进真实仓库的 .workflow/plans/，
+    # 污染仓库状态，且 `ls ... | head -1` 挑到的还可能是历史遗留的旧目录，导致断言随机失败。
     CONFIG_DIR_GLOBAL="$TMP_DIR/config-global"
     CONFIG_FILE_GLOBAL="$CONFIG_DIR_GLOBAL/config.json"
     CONFIG_DIR_PROJECT="$TMP_DIR/project/.sparring"
     CONFIG_FILE_PROJECT="$CONFIG_DIR_PROJECT/config.json"
+    PROJECT_ROOT="$TMP_DIR/project"
+    WORKFLOW_DIR="$TMP_DIR/project/.workflow"
+    PLANS_DIR="$TMP_DIR/project/.workflow/plans"
 
     # 清掉可能残留的 warn 哨兵文件（避免测试间互相干扰）
     rm -f "${TMPDIR:-/tmp}/workflow-cfg-warn-$$-"* 2>/dev/null || true
@@ -229,7 +236,7 @@ test_create_task_structure() {
     reviewer=$(jq -r '.reviewer' "$task_dir/meta.json")
     status=$(jq -r '.status' "$task_dir/meta.json")
     assert_eq "executor is claude" "claude" "$executor"
-    assert_eq "reviewer is cursor" "cursor" "$reviewer"
+    assert_eq "reviewer is glm" "glm" "$reviewer"
     assert_eq "initial status is proposal" "proposal" "$status"
 }
 test_create_task_structure
@@ -248,7 +255,7 @@ test_create_task_cursor_executor() {
     executor=$(jq -r '.executor' "$task_dir/meta.json")
     reviewer=$(jq -r '.reviewer' "$task_dir/meta.json")
     assert_eq "executor is cursor" "cursor" "$executor"
-    assert_eq "reviewer follows default backend(cursor)" "cursor" "$reviewer"
+    assert_eq "reviewer follows default backend(glm)" "glm" "$reviewer"
 }
 test_create_task_cursor_executor
 
@@ -333,7 +340,7 @@ test_review_backend_default() {
     unset WORKFLOW_REVIEW_BACKEND
     local backend
     backend=$(get_review_backend)
-    assert_eq "default review backend" "cursor" "$backend"
+    assert_eq "default review backend" "glm" "$backend"
 }
 test_review_backend_default
 
@@ -745,7 +752,7 @@ test_config_defaults() {
     local backend timeout
     backend=$(_config_get review.backend)
     timeout=$(_config_get review.timeout)
-    assert_eq "默认 backend=cursor" "cursor" "$backend"
+    assert_eq "默认 backend=glm" "glm" "$backend"
     assert_eq "默认 timeout=120" "120" "$timeout"
 }
 test_config_defaults
@@ -884,7 +891,7 @@ test_config_malformed_file() {
     local backend
     backend=$(_config_get review.backend 2>/dev/null)
     # 格式错的文件被忽略，应该回退到默认
-    assert_eq "非法 JSON 文件回退到默认" "cursor" "$backend"
+    assert_eq "非法 JSON 文件回退到默认" "glm" "$backend"
     rm -f "$CONFIG_FILE_GLOBAL"
 }
 test_config_malformed_file

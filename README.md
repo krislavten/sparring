@@ -162,9 +162,9 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 
 | Backend | 账号 | 特点 | 推荐场景 |
 |---------|------|------|---------|
-| 🤖 `cursor` | Cursor 订阅 | 默认后端，`gpt-5.5-extra-high` | 日常主力 |
+| 🌟 `glm` | 智谱按量付费 | **默认后端**，国产、API key 就能用 | 日常主力 / 无订阅 |
+| 🤖 `cursor` | Cursor 订阅 | `gpt-5.5-extra-high` | 有 Cursor 订阅时可用 |
 | 🧪 `codex` | OpenAI 订阅 | Codex CLI，reasoning 可调 | Codex 额度充足 |
-| 🌟 `glm` | 智谱按量付费 | 国产、API key 就能用 | 降级兜底 / 无订阅 |
 | 🧠 `claude` | Claude Code CLI | 用 `claude -p` 跑 review；可**换后端模型**（原生 Claude / GLM / DeepSeek...） | 想用 Claude Code harness，或拿它驱动第三方模型 |
 
 ### 主 + 备降级
@@ -178,16 +178,19 @@ AI 写代码快，但会犯错——幻觉 API、漏掉边界、引入回归。�
 **典型组合**（写进你**全局**配置 `~/.config/sparring/config.json`，按个人偏好；项目级不要设 backend）：
 
 ```jsonc
-// A) Cursor 主 + GLM 备（推荐，Cursor 抽风也不阻塞）
-{ "review": { "backend": "cursor", "fallback": "glm" } }
-
-// B) Codex 主 + GLM 备（Codex 额度省着用）
-{ "review": { "backend": "codex", "fallback": "glm" } }
-
-// C) 纯 GLM（无订阅，按量付费）
+// A) 纯 GLM（默认，无订阅也能跑，按量付费）
 { "review": { "backend": "glm" } }
 
-// D) Claude Code（原生，用本机已登录的 Claude）
+// B) GLM 主 + Claude Code 备（本机已登录 Claude Code 时可选加个兜底）
+{ "review": { "backend": "glm", "fallback": "claude" } }
+
+// C) Cursor 主 + GLM 备（有 Cursor 订阅时可用）
+{ "review": { "backend": "cursor", "fallback": "glm" } }
+
+// D) Codex 主 + GLM 备（Codex 额度省着用）
+{ "review": { "backend": "codex", "fallback": "glm" } }
+
+// E) Claude Code（原生，用本机已登录的 Claude）
 { "review": { "backend": "claude" },
   "claude": { "model": "claude-opus-4-8" } }
 ```
@@ -240,8 +243,8 @@ sparring config get glm.api_key   # 取单值（敏感字段掩码）
 ```json
 {
   "review": {
-    "backend": "cursor",
-    "fallback": "glm",
+    "backend": "glm",
+    "fallback": null,
     "timeout": 120,
     "retries": 1
   },
@@ -283,7 +286,7 @@ export SPARRING_REVIEW_TIMEOUT=180       # → review.timeout（示例：临时�
 
 | key | 默认 | 说明 |
 |---|---|---|
-| `review.backend` | `cursor` | 主后端：`cursor` / `codex` / `glm` / `claude` |
+| `review.backend` | `glm` | 主后端：`cursor` / `codex` / `glm` / `claude` |
 | `review.fallback` | `null` | 备后端（可选） |
 | `review.timeout` | `120` | 单次调用超时秒数起始值（会按内容大小再自适应加时，见上） |
 | `review.retries` | `1` | 失败后重试次数（共尝试 retries+1 次） |

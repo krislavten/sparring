@@ -162,9 +162,9 @@ Four backends, freely combinable as primary + fallback:
 
 | Backend | Account | Notes | Best for |
 |---------|---------|-------|---------|
-| 🤖 `cursor` | Cursor subscription | Default, `gpt-5.5-extra-high` | Daily driver |
+| 🌟 `glm` | Zhipu pay-as-you-go | **Default backend**, just needs an API key | Daily driver / no subscription |
+| 🤖 `cursor` | Cursor subscription | `gpt-5.5-extra-high` | When you have a Cursor subscription |
 | 🧪 `codex` | OpenAI subscription | Codex CLI, tunable reasoning | Codex quota to burn |
-| 🌟 `glm` | Zhipu pay-as-you-go | Just needs an API key | Fallback / no subscription |
 | 🧠 `claude` | Claude Code CLI | Runs review via `claude -p`; can **swap the backend model** (native Claude / GLM / DeepSeek...) | Use the Claude Code harness, or drive a third-party model with it |
 
 ### Primary + Fallback
@@ -178,16 +178,19 @@ If the primary backend fails (timeout / network error / CLI crash), Sparring **a
 **Common setups**:
 
 ```jsonc
-// A) Cursor primary + GLM fallback (recommended — survives Cursor outages)
-{ "review": { "backend": "cursor", "fallback": "glm" } }
-
-// B) Codex primary + GLM fallback (preserve Codex quota)
-{ "review": { "backend": "codex", "fallback": "glm" } }
-
-// C) GLM only (no subscription, pay-as-you-go)
+// A) GLM only (default — works with no subscription, pay-as-you-go)
 { "review": { "backend": "glm" } }
 
-// D) Claude Code (native — uses your logged-in Claude)
+// B) GLM primary + Claude Code fallback (optional, if you already have Claude Code logged in locally)
+{ "review": { "backend": "glm", "fallback": "claude" } }
+
+// C) Cursor primary + GLM fallback (when you have a Cursor subscription)
+{ "review": { "backend": "cursor", "fallback": "glm" } }
+
+// D) Codex primary + GLM fallback (preserve Codex quota)
+{ "review": { "backend": "codex", "fallback": "glm" } }
+
+// E) Claude Code (native — uses your logged-in Claude)
 { "review": { "backend": "claude" },
   "claude": { "model": "claude-opus-4-8" } }
 ```
@@ -240,8 +243,8 @@ sparring config get glm.api_key   # single value (sensitive fields masked)
 ```json
 {
   "review": {
-    "backend": "cursor",
-    "fallback": "glm",
+    "backend": "glm",
+    "fallback": null,
     "timeout": 120,
     "retries": 1
   },
@@ -252,18 +255,18 @@ sparring config get glm.api_key   # single value (sensitive fields masked)
 }
 ```
 
-**Project config** `.sparring/config.json` (**commit by default**, team-shared backend choice):
+**Project config** `.sparring/config.json` (**commit by default**, only team-wide non-subjective settings like timeout/retries):
 
 ```json
 {
   "review": {
-    "backend": "cursor",
-    "fallback": "glm"
+    "timeout": 120,
+    "retries": 1
   }
 }
 ```
 
-> ⚠️ **Never put `api_key` in project config** — it's tracked by git and will leak to every collaborator. Keys belong in the global config (chmod 600) or `SPARRING_GLM_API_KEY` env var.
+> ⚠️ **Never set `review.backend` / `fallback` / model / `api_key` in project config.** Which reviewer backend and model to use is each developer's own choice via **their own global config** (project config wins over global, so setting it there would override everyone's personal choice); `api_key` especially must never be committed.
 
 **Env var overrides** (`SPARRING_*` preferred; `WORKFLOW_*` kept for backward compat):
 
@@ -281,7 +284,7 @@ export SPARRING_REVIEW_TIMEOUT=180       # → review.timeout (example: temporar
 
 | key | default | notes |
 |---|---|---|
-| `review.backend` | `cursor` | Primary: `cursor` / `codex` / `glm` |
+| `review.backend` | `glm` | Primary: `cursor` / `codex` / `glm` / `claude` |
 | `review.fallback` | `null` | Fallback backend (optional) |
 | `review.timeout` | `120` | Starting per-call timeout in seconds (auto-scales with content size, see above) |
 | `review.retries` | `1` | Retries after failure (total attempts = retries + 1) |
