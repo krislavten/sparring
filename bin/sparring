@@ -122,7 +122,15 @@ reviewer_label_for_backend() {
         cursor) echo "Cursor Agent" ;;
         codex)  echo "Codex CLI" ;;
         glm)    echo "GLM" ;;
-        claude) echo "Claude Code" ;;
+        claude)
+            local mode
+            mode=$(_config_get claude.mode)
+            if [[ "$mode" == "agent" ]]; then
+                echo "Claude Code (agent)"
+            else
+                echo "Claude Code"
+            fi
+            ;;
         *)      echo "$backend" ;;
     esac
 }
@@ -232,12 +240,15 @@ check_claude() {
 
 find_project_root() {
     local dir="$PWD"
+    # Walk up preferring .workflow (sparring project root) over bare git root.
+    # Check [[ -e .git ]] instead of [[ -d .git ]] so git worktrees are detected:
+    # in a worktree .git is a file (gitdir pointer), not a directory.
     while [[ "$dir" != "/" ]]; do
         if [[ -d "$dir/.workflow" ]]; then
             echo "$dir"
             return 0
         fi
-        if [[ -d "$dir/.git" ]]; then
+        if [[ -e "$dir/.git" ]]; then
             echo "$dir"
             return 0
         fi
@@ -287,6 +298,7 @@ _config_defaults() {
     "api_base": "https://open.bigmodel.cn/api/paas/v4"
   },
   "claude": {
+    "mode": "diff",
     "model": null,
     "base_url": null,
     "api_key": null,
@@ -399,6 +411,19 @@ _workflow_legacy_alias() {
 }
 PLANS_DIR="${WORKFLOW_DIR}/plans"
 REVIEW_JOBS_DIR="${WORKFLOW_DIR}/review-jobs"
+
+# ─── Review 约定 (.sparring/REVIEW.md) ──────────────────────
+# 查找顺序：项目级 → 全局 → 空字符串
+# 注入到所有 reviewer prompt 中（diff 模式内联；agent 模式通过 --add-dir 也能自行读取）
+load_review_conventions() {
+    local project_file="${CONFIG_DIR_PROJECT}/REVIEW.md"
+    local global_file="${CONFIG_DIR_GLOBAL}/REVIEW.md"
+    if [[ -f "$project_file" ]]; then
+        cat "$project_file"
+    elif [[ -f "$global_file" ]]; then
+        cat "$global_file"
+    fi
+}
 
 # ─── 输入验证 ───────────────────────────────────────────────
 
@@ -1200,10 +1225,17 @@ ${prompt}"
 # 两种用法：
 #   原生 Claude   — base_url 留空，复用本机已登录的 Claude Code（OAuth / ANTHROPIC_API_KEY）
 #   第三方模型    — 设 claude.base_url + api_key + model 指向各家 Anthropic 兼容端点（GLM / DeepSeek...）
-# 关键隔离（见 README）：
+# 两种模式（claude.mode）：
+#   diff  （默认）— 禁全部工具，prompt 含静态 diff 文本；任何 base_url 端点均可用
+#   agent          — 开放只读工具（Read/Grep/Glob）+ --add-dir 挂载 PROJECT_ROOT；
+#                    reviewer 自主探索仓库文件上下文；Bash 仍禁用（防 prompt injection）；
+#                    仅原生 claude CLI 支持（base_url 设置时自动降级 diff）
+# 关键隔离：
 #   - 强制在 mktemp 空目录里运行 → 阻断 cwd 向上的项目 CLAUDE.md 注入
 #   - 第三方路径用全新空 config_dir → 连全局 CLAUDE.md + 残留登录态一并隔离
-#   - 禁全部 agentic 工具（-p 默认拒权 + --disallowedTools 兜底）→ 单发纯文本裁决，递归结构上不可能
+#   - diff 模式禁全部 agentic 工具 → 单发纯文本裁决，递归结构上不可能
+#   - agent 模式禁写类工具 + Bash（Edit/Write/NotebookEdit/Task/WebFetch/WebSearch/Bash）
+#   - agent 模式失败时自动降级到 diff 模式重试一次
 call_claude_agent() {
     local prompt="$1"
     local max_attempts
@@ -1212,13 +1244,20 @@ call_claude_agent() {
 
     check_claude || return 1
 
-    local model base_url api_key config_dir use_proxy extra_args
+    local mode model base_url api_key config_dir use_proxy extra_args
+    mode=$(_config_get claude.mode)
     model=$(_config_get claude.model)
     base_url=$(_config_get claude.base_url)
     api_key=$(_config_get claude.api_key)
     config_dir=$(_config_get claude.config_dir)
     use_proxy=$(_config_get claude.use_proxy)
     extra_args=$(_config_get claude.extra_args)
+
+    # agent 模式依赖原生 claude 工具访问；第三方端点无法使用 → 静默降级
+    [[ "$mode" == "agent" && -n "$base_url" ]] && {
+        echo -e "${DIM}  (claude.mode=agent 与 base_url 不兼容，降级到 diff 模式)${NC}" >&2
+        mode="diff"
+    }
 
     # ── 隔离 config dir ──
     local ephemeral_cfg=""
@@ -1240,7 +1279,33 @@ call_claude_agent() {
     output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-out.XXXXXX")
     log_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-log.XXXXXX")
 
-    cat > "$prompt_file" <<EOF
+    # ── 组装 env ──
+    local -a envs=("CLAUDE_CONFIG_DIR=$config_dir")
+    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+    if [[ -n "$base_url" ]]; then               # 第三方模型路径
+        envs+=("ANTHROPIC_BASE_URL=$base_url")
+        envs+=("ANTHROPIC_AUTH_TOKEN=$api_key")
+        envs+=("ANTHROPIC_API_KEY=")            # 清空 env 残留；叠加全新空 config dir(无 .credentials) 双保险
+        [[ -n "$model" ]] && envs+=("ANTHROPIC_MODEL=$model")
+    fi
+
+    local model_desc="${model:-default(已登录账号)}"
+    local route_desc="原生 Claude"
+    [[ -n "$base_url" ]] && route_desc="第三方端点 ${base_url}"
+
+    # 清理：每个 return 前显式 rm（mirror codex/glm）。不用 trap RETURN ——
+    # 本函数在 result=$(_call_backend ...) 子 shell 里跑且脚本 set -u；RETURN trap 是全局状态，
+    # 会在外层 _call_backend/call_reviewer 返回时再次触发，那里 $_cleanup 未定义 → unbound variable。
+    # 也不用 EXIT trap（见 line 309）。_timeout_cmd 超时是 SIGKILL 子进程 claude，本函数仍正常走到下方清理。
+    local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\"; rm -rf \"$run_cwd\""
+    [[ -n "$ephemeral_cfg" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cfg\""
+
+    # ── 内部执行函数：写 prompt 文件并运行 claude，输出到 output_file ──
+    # 参数：$1=effective_mode  $2=prompt_text
+    _run_claude_once() {
+        local eff_mode="$1" eff_prompt="$2"
+
+        cat > "$prompt_file" <<EOF
 你在 Dual AI Workflow 中担任严格 reviewer。
 
 响应格式必须严格二选一：
@@ -1257,46 +1322,40 @@ CONCERNS
 
 始终用中文，且不要输出其他格式。
 
-${prompt}
+${eff_prompt}
 EOF
 
-    # ── 组装 env ──
-    local -a envs=("CLAUDE_CONFIG_DIR=$config_dir")
-    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
-    if [[ -n "$base_url" ]]; then               # 第三方模型路径
-        envs+=("ANTHROPIC_BASE_URL=$base_url")
-        envs+=("ANTHROPIC_AUTH_TOKEN=$api_key")
-        envs+=("ANTHROPIC_API_KEY=")            # 清空 env 残留；叠加全新空 config dir(无 .credentials) 双保险
-        [[ -n "$model" ]] && envs+=("ANTHROPIC_MODEL=$model")
-    fi
+        local -a cmd=(claude -p --output-format text)
+        [[ -n "$model" ]] && cmd+=(--model "$model")
 
-    # ── 命令：纯文本单发，禁全部 agentic 工具 ──
-    # 主防线：-p 不带 --dangerously-skip-permissions → 需授权工具自动拒绝（前向兼容，新工具默认挡）
-    # 兜底：--disallowedTools 显式列出当前工具
-    local -a claude_cmd=(claude -p --output-format text)
-    [[ -n "$model" ]] && claude_cmd+=(--model "$model")
-    claude_cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task")
-    # shellcheck disable=SC2206
-    [[ -n "$extra_args" ]] && claude_cmd+=($extra_args)
+        if [[ "$eff_mode" == "agent" ]]; then
+            # 开放只读工具（Read/Grep/Glob），挂载 PROJECT_ROOT 供探索。
+            # Bash 显式禁用：reviewer 不需要执行命令，且禁 Bash 可防止 diff 内
+            # prompt injection 借 Bash 执行任意系统命令（rm/curl 等）。
+            cmd+=(--add-dir "$PROJECT_ROOT")
+            cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Task WebFetch WebSearch")
+        else
+            # diff 模式：禁全部 agentic 工具，纯文本单发
+            # 主防线：-p 不带 --dangerously-skip-permissions → 新工具默认挡
+            # 兜底：--disallowedTools 显式列出
+            cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task")
+        fi
 
-    local model_desc="${model:-default(已登录账号)}"
-    local route_desc="原生 Claude"
-    [[ -n "$base_url" ]] && route_desc="第三方端点 ${base_url}"
-    echo -e "${DIM}  使用 Claude Code | 模型: ${model_desc} | 路由: ${route_desc}${NC}" >&2
-    echo -e "${DIM}  CLAUDE_CONFIG_DIR: ${config_dir}${NC}" >&2
+        # shellcheck disable=SC2206
+        [[ -n "$extra_args" ]] && cmd+=($extra_args)
 
-    # 清理：每个 return 前显式 rm（mirror codex/glm）。不用 trap RETURN ——
-    # 本函数在 result=$(_call_backend ...) 子 shell 里跑且脚本 set -u；RETURN trap 是全局状态，
-    # 会在外层 _call_backend/call_reviewer 返回时再次触发，那里 $_cleanup 未定义 → unbound variable。
-    # 也不用 EXIT trap（见 line 309）。_timeout_cmd 超时是 SIGKILL 子进程 claude，本函数仍正常走到下方清理。
-    local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\"; rm -rf \"$run_cwd\""
-    [[ -n "$ephemeral_cfg" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cfg\""
+        echo -e "${DIM}  使用 Claude Code (${eff_mode} 模式) | 模型: ${model_desc} | 路由: ${route_desc}${NC}" >&2
+        echo -e "${DIM}  CLAUDE_CONFIG_DIR: ${config_dir}${NC}" >&2
 
+        ( cd "$run_cwd" && _timeout_cmd "$(_adaptive_timeout "$eff_prompt")" \
+            env "${envs[@]}" "${cmd[@]}" \
+            < "$prompt_file" > "$output_file" 2>"$log_file" )
+    }
+
+    # ── 执行（含重试逻辑）──
     local i
     for i in $(seq 1 $max_attempts); do
-        if ( cd "$run_cwd" && _timeout_cmd "$(_adaptive_timeout "$prompt")" \
-                env "${envs[@]}" "${claude_cmd[@]}" \
-                < "$prompt_file" > "$output_file" 2>"$log_file" ); then
+        if _run_claude_once "$mode" "$prompt"; then
             break
         fi
 
@@ -1304,6 +1363,13 @@ EOF
             echo -e "${DIM}  claude 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
             sleep 2
         else
+            # agent 模式失败 → 降级 diff 重试一次（diff 模式直接报错）
+            if [[ "$mode" == "agent" ]]; then
+                echo -e "${YELLOW}⚠ agent 模式调用失败，降级到 diff 模式重试...${NC}" >&2
+                if _run_claude_once "diff" "$prompt"; then
+                    break
+                fi
+            fi
             local err_output
             err_output=$(cat "$log_file" 2>/dev/null | tail -c 400 || true)
             eval "$_cleanup"
@@ -1437,6 +1503,10 @@ USAGE
     if [[ -n "$title" ]]; then
         content="【审查主题】${title}"$'\n\n'"$content"
     fi
+
+    local conventions
+    conventions=$(load_review_conventions)
+    [[ -n "$conventions" ]] && content="$content"$'\n\n## Review 约定\n'"$conventions"
 
     local result rc=0
     result=$(call_reviewer "$content" "") || rc=$?
@@ -1626,12 +1696,17 @@ review_proposal() {
     local proposal_content
     proposal_content=$(cat "${task_dir}/proposal.md")
 
+    local conventions
+    conventions=$(load_review_conventions)
+    local conventions_section=""
+    [[ -n "$conventions" ]] && conventions_section=$'\n\n## Review 约定\n'"$conventions"
+
     local prompt="你正在 review 一份技术方案。
 
 任务: $(jq -r '.task_name' "${task_dir}/meta.json")
 
 方案内容:
-${proposal_content}
+${proposal_content}${conventions_section}
 
 请 review 并回复:
 - APPROVE: 如果方案合理可行
@@ -1757,12 +1832,17 @@ review_code() {
         return 1
     fi
 
+    local conventions
+    conventions=$(load_review_conventions)
+    local conventions_section=""
+    [[ -n "$conventions" ]] && conventions_section=$'\n\n## Review 约定\n'"$conventions"
+
     local prompt="你正在 review 代码实现。
 
 任务: $(jq -r '.task_name' "${task_dir}/meta.json")
 
 代码改动:
-${diff_content}
+${diff_content}${conventions_section}
 
 请 review 并回复:
 - APPROVE: 如果代码质量良好
