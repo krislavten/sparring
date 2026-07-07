@@ -397,6 +397,11 @@ sparring verify                 # 检查环境
 sparring review [--title <主题>] [<内容>]      # 内容从参数和/或 stdin 传入（可并用）
 git diff origin/main...HEAD | sparring review --title "<改动主题>"
 #   退出码 0=APPROVE  2=CONCERNS  1=调用错误/解析不出裁决
+#   diff 输入自带体量门禁：denylist 剔除 lockfile/构建产物/.env 等文件段后，
+#   超预算（默认 400 行，防 reviewer 超时跑飞）直接拒绝并提示按文件分片。
+#   --max-diff-lines <N>（0=不限）/ --exclude <glob> / --no-default-excludes
+#   config: review.max_diff_lines、review.exclude（数组）；纯文本结论不受影响
+git diff origin/main...HEAD -- src/core | sparring review --title "core 分片"
 
 # 任务
 sparring create <name> <claude|cursor>

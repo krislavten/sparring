@@ -910,25 +910,38 @@ load_agent_config() {
 _timeout_cmd() {
     local duration="$1"
     shift
+    # -k 5: TERM 后 5s 仍活着补 SIGKILL（跑飞的 curl 可能不理 TERM，
+    # 实测出现过超时设置形同虚设、请求挂满 20min 的情况）
     if command -v timeout &>/dev/null; then
-        timeout "$duration" "$@"
+        timeout -k 5 "$duration" "$@"
     elif command -v gtimeout &>/dev/null; then
-        gtimeout "$duration" "$@"
+        gtimeout -k 5 "$duration" "$@"
     else
-        # macOS fallback: use perl
+        # macOS fallback: perl。与 GNU timeout 对齐：超时先 TERM，
+        # 2s 内没退干净补 KILL；超时退出码 124；子进程死于信号时
+        # 返回 128+sig（旧实现 $? >> 8 会把 SIGKILL 死亡误报成 exit 0）
         perl -e '
             use POSIX ":sys_wait_h";
             my $timeout = shift @ARGV;
             my $pid = fork();
-            if ($pid == 0) { exec @ARGV; exit 1; }
-            eval {
-                local $SIG{ALRM} = sub { kill "TERM", $pid; die "timeout\n"; };
-                alarm $timeout;
-                waitpid($pid, 0);
-                alarm 0;
+            if ($pid == 0) { exec @ARGV; exit 127; }
+            my $timed_out = 0;
+            local $SIG{ALRM} = sub {
+                $timed_out = 1;
+                kill "TERM", $pid;
+                my $waited = 0;
+                while ($waited < 2 && waitpid($pid, WNOHANG) == 0) {
+                    select(undef, undef, undef, 0.1);
+                    $waited += 0.1;
+                }
+                kill "KILL", $pid if waitpid($pid, WNOHANG) == 0;
             };
-            if ($@ eq "timeout\n") { exit 124; }
-            exit ($? >> 8);
+            alarm $timeout;
+            waitpid($pid, 0);
+            alarm 0;
+            exit 124 if $timed_out;
+            my $st = $?;
+            exit(($st & 127) ? 128 + ($st & 127) : ($st >> 8));
         ' "$duration" "$@"
     fi
 }
@@ -1106,7 +1119,7 @@ EOF
 
     rm -f "$output_file" "$prompt_file" "$command_output_file"
 
-    if [[ -z "${result//[[:space:]]/}" ]]; then
+    if [[ "$result" != *[![:space:]]* ]]; then
         echo -e "${RED}错误: codex 返回空结果${NC}" >&2
         return 1
     fi
@@ -1203,7 +1216,7 @@ ${prompt}"
     # GLM 响应：choices[0].message.content；空字符串时不应兜底到 reasoning_content
     # （reasoning 不遵守 APPROVE/CONCERNS 格式，会让上层解析失败）
     result=$(jq -r '.choices[0].message.content // empty' "$response_file" 2>/dev/null)
-    if [[ -z "${result//[[:space:]]/}" ]]; then
+    if [[ "$result" != *[![:space:]]* ]]; then
         # content 为空字符串时，jq `//` 不会回退，手动检查 reasoning 提示用户调参
         local has_reasoning
         has_reasoning=$(jq -r '(.choices[0].message.reasoning_content // "") | length > 0' "$response_file" 2>/dev/null)
@@ -1382,7 +1395,7 @@ EOF
     result=$(cat "$output_file" 2>/dev/null || true)
     eval "$_cleanup"
 
-    if [[ -z "${result//[[:space:]]/}" ]]; then
+    if [[ "$result" != *[![:space:]]* ]]; then
         echo -e "${RED}错误: claude 返回空结果${NC}" >&2
         return 1
     fi
@@ -1450,9 +1463,159 @@ call_agent() {
 # ─── 一次性 ad-hoc 审查 ──────────────────────────────────────
 # 审查一段结论/方案/diff，不创建 task，直接走配置的 review backend（默认 glm）。
 # 填补 task 制 review-proposal/review-code 之外的「快速审一条结论」场景。
+
+# Review input budget：diff 体量门禁 + denylist 过滤。
+# 大 diff 直塞推理模型会超时跑飞（实测 ~250 行内 2min 出裁决，~450 行以上
+# 10min 超时）。策略：先剔除 denylist 文件段（lockfile/构建产物/.env——
+# .env 同时避免把密钥送给外部 reviewer API），再对剩余行数设硬上限，
+# 超限拒绝并提示分片。被排除的文件段始终列出，绝不静默截断。
+DEFAULT_MAX_DIFF_LINES=400
+
+_default_diff_excludes() {
+    cat <<'EOF'
+.env*
+*.lock
+pnpm-lock.yaml
+package-lock.json
+go.sum
+*.min.js
+*.min.css
+*.map
+*.snap
+__snapshots__/*
+*.svg
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.ico
+*.woff
+*.woff2
+dist/*
+build/*
+coverage/*
+node_modules/*
+EOF
+}
+
+# config review.exclude（JSON 数组）→ 每行一个 pattern
+_config_review_excludes() {
+    _config_merged | jq -r '.review.exclude[]? // empty' 2>/dev/null || true
+}
+
+# _diff_path_excluded <path> <pattern...>
+# pattern 按 glob 匹配三种形态：完整路径、任意目录前缀下（*/pat）、纯文件名
+_diff_path_excluded() {
+    local path="$1"; shift
+    local base="${path##*/}" pat
+    for pat in "$@"; do
+        [[ -z "$pat" ]] && continue
+        # shellcheck disable=SC2254  # 有意让 pattern 参与 glob 匹配
+        case "$path" in
+            $pat | */$pat) return 0 ;;
+        esac
+        case "$base" in
+            $pat) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# _review_filter_diff <max_lines> [pattern...]
+# stdin: 待审内容 → stdout: 过滤后的内容
+# 无 `diff --git` 标记的纯文本（结论/方案）原样通过，不设预算。
+# denylist 过滤后仍超预算：打印体量分布和分片建议到 stderr，return 1。
+_review_filter_diff() {
+    local max_lines="$1"; shift
+
+    local src
+    src=$(mktemp "${TMPDIR:-/tmp}/sparring-review-input.XXXXXX") || return 1
+    cat > "$src"
+
+    if ! grep -q '^diff --git ' "$src"; then
+        cat "$src"; rm -f "$src"; return 0
+    fi
+
+    local -a starts=() paths=()
+    local line hdr p
+    while IFS= read -r line; do
+        starts+=("${line%%:*}")
+        hdr="${line#*:}"
+        # 取 b/ 侧路径（##* b/ 取最后一处，含空格的未引号路径也能对上；
+        # 带引号的罕见路径不解析 → 不排除，宁可计入预算不漏审）
+        p="${hdr##* b/}"
+        [[ "$hdr" == *' "b/'* ]] && p=""
+        paths+=("$p")
+    done < <(grep -n '^diff --git ' "$src")
+
+    # 用 awk NR 而不是 wc -l：末行无换行符时 wc -l 会少算一行，
+    # 导致最后一个被排除段的末行漏删
+    local total
+    total=$(awk 'END { print NR }' "$src")
+
+    local -a drop_ranges=() dropped_desc=() kept_desc=()
+    local i s e seg_lines n=${#starts[@]} kept_total=0
+    for ((i = 0; i < n; i++)); do
+        s=${starts[i]}
+        if (( i + 1 < n )); then e=$(( ${starts[i+1]} - 1 )); else e=$total; fi
+        seg_lines=$((e - s + 1))
+        if [[ -n "${paths[i]}" ]] && _diff_path_excluded "${paths[i]}" "$@"; then
+            drop_ranges+=("$s:$e")
+            dropped_desc+=("$(printf '%6d  %s' "$seg_lines" "${paths[i]}")")
+        else
+            kept_total=$((kept_total + seg_lines))
+            kept_desc+=("$(printf '%6d  %s' "$seg_lines" "${paths[i]:-<无法解析的路径>}")")
+        fi
+    done
+    # 第一个 diff 标记之前的说明文字也计入预算
+    kept_total=$(( kept_total + starts[0] - 1 ))
+
+    if (( ${#dropped_desc[@]} > 0 )); then
+        {
+            echo -e "${DIM}  denylist 已排除 ${#dropped_desc[@]} 个文件段（不送审）:${NC}"
+            printf "${DIM}%s${NC}\n" "${dropped_desc[@]}"
+        } >&2
+    fi
+
+    if (( max_lines > 0 && kept_total > max_lines )); then
+        {
+            echo -e "${RED}错误: diff 过滤后仍有 ${kept_total} 行，超出预算 ${max_lines} 行${NC}"
+            echo "大 diff 会让 reviewer 超时跑飞（实测 ~450 行以上即不可靠）。建议:"
+            echo "  按文件/目录分片:  git diff <base>...HEAD -- <path> | sparring review"
+            echo "  减少上下文行数:  git diff --unified=2 ..."
+            echo "  先看体量分布:    git diff --stat <base>...HEAD"
+            echo "  调整预算(慎用):  --max-diff-lines <N>（0 = 不限），或 config review.max_diff_lines"
+            echo "最大的文件段:"
+            printf '%s\n' "${kept_desc[@]+"${kept_desc[@]}"}" | sort -rn | head -5
+        } >&2
+        rm -f "$src"
+        return 1
+    fi
+
+    if (( ${#drop_ranges[@]} == 0 )); then
+        cat "$src"
+    else
+        # drop_ranges 按构造即升序且不重叠，单指针扫描 O(N)
+        awk -v ranges="${drop_ranges[*]}" '
+            BEGIN { n = split(ranges, r, " "); for (i = 1; i <= n; i++) { split(r[i], b, ":"); rs[i] = b[1]; re[i] = b[2] } cur = 1 }
+            {
+                while (cur <= n && NR > re[cur]) cur++
+                if (cur <= n && NR >= rs[cur] && NR <= re[cur]) next
+                print
+            }
+        ' "$src"
+    fi
+    rm -f "$src"
+    return 0
+}
+
 review_adhoc() {
     local title=""
     local content=""
+    local max_diff_lines=""
+    local no_default_excludes=false
+    local -a extra_excludes=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --title)
@@ -1463,15 +1626,47 @@ review_adhoc() {
                 title="$2"
                 shift 2
                 ;;
+            --max-diff-lines)
+                if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+                    echo -e "${RED}错误: --max-diff-lines 需要一个非负整数（0 = 不限）${NC}" >&2
+                    return 1
+                fi
+                max_diff_lines="$2"
+                shift 2
+                ;;
+            --exclude)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}错误: --exclude 需要一个 glob pattern${NC}" >&2
+                    return 1
+                fi
+                extra_excludes+=("$2")
+                shift 2
+                ;;
+            --no-default-excludes)
+                no_default_excludes=true
+                shift
+                ;;
             -h|--help)
                 cat >&2 <<'USAGE'
-用法: sparring review [--title <主题>] [<内容>]
+用法: sparring review [选项] [<内容>]
   审查一段结论/方案/diff，不创建 task；内容由参数和/或 stdin 传入。
   走当前配置的 review backend（review.backend，默认 glm）。
   退出码: 0=APPROVE  2=CONCERNS  1=调用错误
+
+diff 输入自带体量门禁（纯文本结论不受影响）：
+  先剔除 denylist 文件段（lockfile / 构建产物 / .env / 图片字体等，
+  以及 config review.exclude 数组里的 pattern），过滤后仍超预算则拒绝
+  （默认 400 行——大 diff 会让 reviewer 超时跑飞，请按文件分片送审）。
+
+选项:
+  --title <主题>          审查主题，会拼在内容前
+  --max-diff-lines <N>    diff 行数预算，0 = 不限（默认 400，config: review.max_diff_lines）
+  --exclude <glob>        追加排除 pattern，可重复（config: review.exclude 数组）
+  --no-default-excludes   不用内置 denylist（--exclude 指定的仍生效）
 示例:
   echo "<上下文+结论>" | sparring review
   git diff origin/main...HEAD | sparring review --title "改动主题"
+  git diff origin/main...HEAD -- src/core | sparring review --title "core 部分"
 USAGE
                 return 0
                 ;;
@@ -1495,8 +1690,31 @@ USAGE
         fi
     fi
 
-    if [[ -z "${content//[[:space:]]/}" ]]; then
+    # 注意：不要用 ${content//[[:space:]]/} 判空——bash 对大字符串做全量
+    # pattern 删除是灾难级慢（22KB diff 实测卡死数十秒），glob 单遍短路即可
+    if [[ "$content" != *[![:space:]]* ]]; then
         echo -e "${RED}错误: 没有收到要审查的内容（用参数或 stdin 传入）${NC}" >&2
+        return 1
+    fi
+
+    # diff 体量门禁 + denylist（详见 _review_filter_diff；纯文本原样通过）
+    if [[ -z "$max_diff_lines" ]]; then
+        max_diff_lines=$(_config_get review.max_diff_lines)
+        [[ "$max_diff_lines" =~ ^[0-9]+$ ]] || max_diff_lines=$DEFAULT_MAX_DIFF_LINES
+    fi
+    local -a exclude_patterns=()
+    if [[ "$no_default_excludes" != true ]]; then
+        local pat
+        while IFS= read -r pat; do
+            [[ -n "$pat" ]] && exclude_patterns+=("$pat")
+        done < <(_default_diff_excludes; _config_review_excludes)
+    fi
+    exclude_patterns+=(${extra_excludes[@]+"${extra_excludes[@]}"})
+    content=$(printf '%s' "$content" | _review_filter_diff "$max_diff_lines" \
+        ${exclude_patterns[@]+"${exclude_patterns[@]}"}) || return 1
+    if [[ "$content" != *[![:space:]]* ]]; then
+        echo -e "${RED}错误: denylist 过滤后没有剩余可审内容（全部文件段都被排除）${NC}" >&2
+        echo "  如确要审这些文件: --no-default-excludes 或调整 --exclude" >&2
         return 1
     fi
 
