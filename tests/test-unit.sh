@@ -1524,6 +1524,169 @@ test_claude_agent_mode_downgrade_with_base_url() {
 }
 test_claude_agent_mode_downgrade_with_base_url
 
+# ─── review input budget（diff 门禁 + denylist）──────────────
+
+echo ""
+echo "=== review input budget ==="
+
+# 生成一个 diff 文件段：路径 + N 行 payload
+_gen_diff_section() {
+    local path="$1" lines="$2" i
+    echo "diff --git a/$path b/$path"
+    echo "index 0000000..1111111 100644"
+    echo "--- a/$path"
+    echo "+++ b/$path"
+    echo "@@ -0,0 +1,$lines @@"
+    for ((i = 1; i <= lines; i++)); do echo "+line $i of $path"; done
+}
+
+test_diff_path_excluded() {
+    source_workflow_funcs
+    local -a pats=()
+    while IFS= read -r p; do [[ -n "$p" ]] && pats+=("$p"); done < <(_default_diff_excludes)
+
+    local rc
+    _diff_path_excluded "pnpm-lock.yaml" "${pats[@]}" && rc=0 || rc=$?
+    assert_eq "顶层 lockfile 命中 denylist" "0" "$rc"
+    _diff_path_excluded "apps/web/pnpm-lock.yaml" "${pats[@]}" && rc=0 || rc=$?
+    assert_eq "嵌套 lockfile 命中 denylist" "0" "$rc"
+    _diff_path_excluded ".env.local" "${pats[@]}" && rc=0 || rc=$?
+    assert_eq ".env.local 命中 denylist" "0" "$rc"
+    _diff_path_excluded "pkg/vendor/node_modules/x/index.js" "${pats[@]}" && rc=0 || rc=$?
+    assert_eq "嵌套 node_modules 命中 denylist" "0" "$rc"
+    _diff_path_excluded "src/core/review.ts" "${pats[@]}" && rc=0 || rc=$?
+    assert_eq "正常源码不命中 denylist" "1" "$rc"
+    _diff_path_excluded "src/environment.ts" "${pats[@]}" && rc=0 || rc=$?
+    assert_eq ".env* 不误伤 environment.ts" "1" "$rc"
+}
+test_diff_path_excluded
+
+test_filter_plain_text_passthrough() {
+    source_workflow_funcs
+    local input out rc=0
+    input=$(for i in $(seq 1 500); do echo "结论第 $i 行"; done)
+    out=$(printf '%s' "$input" | _review_filter_diff 400) || rc=$?
+    assert_eq "纯文本超 400 行也原样通过（预算只管 diff）" "0" "$rc"
+    assert_eq "纯文本内容不被改动" "$input" "$out"
+}
+test_filter_plain_text_passthrough
+
+test_filter_drops_denylisted_section() {
+    source_workflow_funcs
+    local input out rc=0
+    input=$(_gen_diff_section "src/app.ts" 10; _gen_diff_section "pnpm-lock.yaml" 50; _gen_diff_section "src/util.ts" 8)
+    out=$(printf '%s' "$input" | _review_filter_diff 400 "pnpm-lock.yaml" 2>/dev/null) || rc=$?
+    assert_eq "denylist 过滤正常返回" "0" "$rc"
+    assert_contains "保留 src/app.ts 段" "b/src/app.ts" "$out"
+    assert_contains "保留 src/util.ts 段" "b/src/util.ts" "$out"
+    if echo "$out" | grep -q "pnpm-lock.yaml"; then
+        echo "  ✗ lockfile 段应被剔除"; ((FAIL++))
+    else
+        echo "  ✓ lockfile 段被剔除"; ((PASS++))
+    fi
+    # 末段被排除 + 输入无结尾换行：末行也要删干净（wc -l 陷阱回归）
+    local out2
+    out2=$(printf '%s' "$(_gen_diff_section "src/a.ts" 3; _gen_diff_section "b.lock" 5)" \
+        | _review_filter_diff 400 "*.lock" 2>/dev/null)
+    if printf '%s' "$out2" | grep -q "of b.lock"; then
+        echo "  ✗ 无结尾换行时末段残留"; ((FAIL++))
+    else
+        echo "  ✓ 无结尾换行时末段删干净"; ((PASS++))
+    fi
+}
+test_filter_drops_denylisted_section
+
+test_filter_budget_reject() {
+    source_workflow_funcs
+    local input err rc=0
+    input=$(_gen_diff_section "src/big.ts" 500)
+    err=$(printf '%s' "$input" | _review_filter_diff 400 2>&1 >/dev/null) || rc=$?
+    assert_eq "超预算拒绝 rc=1" "1" "$rc"
+    assert_contains "报错含分片建议" "按文件/目录分片" "$err"
+    assert_contains "报错含最大文件段" "src/big.ts" "$err"
+
+    rc=0
+    printf '%s' "$input" | _review_filter_diff 0 >/dev/null 2>&1 || rc=$?
+    assert_eq "预算 0 = 不限，放行" "0" "$rc"
+
+    # denylist 先过滤再算预算：lockfile 巨段不该触发拒绝
+    rc=0
+    input=$(_gen_diff_section "src/app.ts" 10; _gen_diff_section "pnpm-lock.yaml" 1000)
+    printf '%s' "$input" | _review_filter_diff 400 "pnpm-lock.yaml" >/dev/null 2>&1 || rc=$?
+    assert_eq "denylist 过滤后不超预算则放行" "0" "$rc"
+}
+test_filter_budget_reject
+
+test_review_adhoc_budget_gate() {
+    source_workflow_funcs
+    local rc=0 err
+    # 超预算：应在调 reviewer 之前就拒绝（不会打到网络）
+    err=$(_gen_diff_section "src/huge.ts" 900 | review_adhoc --title "t" 2>&1 >/dev/null) || rc=$?
+    assert_eq "review_adhoc 超预算拒绝 rc=1" "1" "$rc"
+    assert_contains "review_adhoc 报错含预算提示" "max-diff-lines" "$err"
+
+    # 全部被排除 → 明确报错而不是送空审
+    rc=0
+    err=$(_gen_diff_section "pnpm-lock.yaml" 20 | review_adhoc 2>&1 >/dev/null) || rc=$?
+    assert_eq "全被 denylist 排除时 rc=1" "1" "$rc"
+    assert_contains "全排除报错提示" "没有剩余可审内容" "$err"
+
+    # --exclude 追加 pattern + --max-diff-lines 覆盖默认
+    rc=0
+    err=$(_gen_diff_section "docs/gen.md" 30 | review_adhoc --exclude 'docs/*' 2>&1 >/dev/null) || rc=$?
+    assert_eq "--exclude 全排除时 rc=1" "1" "$rc"
+    rc=0
+    err=$(_gen_diff_section "src/a.ts" 30 | review_adhoc --max-diff-lines 10 2>&1 >/dev/null) || rc=$?
+    assert_eq "--max-diff-lines 覆盖默认值" "1" "$rc"
+
+    # --no-default-excludes: 同样的 lockfile diff 不再被 denylist 剔除，
+    # 走到预算检查（超预算报错 ≠ 全排除报错，证明 denylist 被禁用）
+    rc=0
+    err=$(_gen_diff_section "pnpm-lock.yaml" 30 | review_adhoc --no-default-excludes --max-diff-lines 10 2>&1 >/dev/null) || rc=$?
+    assert_eq "--no-default-excludes 时 lockfile 不被剔除 rc=1" "1" "$rc"
+    assert_contains "--no-default-excludes 时走到预算拒绝" "超出预算" "$err"
+}
+test_review_adhoc_budget_gate
+
+test_timeout_cmd_perl_fallback() {
+    source_workflow_funcs
+    # PATH 限制到 /usr/bin:/bin 逼出 perl fallback（macOS 无原生 timeout）
+    if PATH="/usr/bin:/bin" command -v timeout >/dev/null 2>&1 \
+        || PATH="/usr/bin:/bin" command -v gtimeout >/dev/null 2>&1; then
+        echo "  - 跳过：/usr/bin:/bin 下存在 timeout，无法逼出 perl fallback"
+        return 0
+    fi
+    if ! PATH="/usr/bin:/bin" command -v perl >/dev/null 2>&1; then
+        echo "  - 跳过：/usr/bin:/bin 下无 perl，fallback 不可测"
+        return 0
+    fi
+
+    local rc=0
+    ( PATH="/usr/bin:/bin"; _timeout_cmd 1 sleep 10 ) >/dev/null 2>&1 || rc=$?
+    assert_eq "perl fallback 超时返回 124" "124" "$rc"
+
+    # 无视 TERM 的进程也要在宽限期后被 KILL 掉，而不是拖满 sleep 时长
+    rc=0
+    local t0 t1
+    t0=$(date +%s)
+    ( PATH="/usr/bin:/bin"; _timeout_cmd 1 perl -e '$SIG{TERM} = sub {}; sleep 30' ) >/dev/null 2>&1 || rc=$?
+    t1=$(date +%s)
+    assert_eq "TERM 免疫进程超时返回 124" "124" "$rc"
+    if (( t1 - t0 < 10 )); then
+        echo "  ✓ TERM 免疫进程在宽限期内被 KILL（用时 $((t1 - t0))s）"; ((PASS++))
+    else
+        echo "  ✗ TERM 免疫进程拖了 $((t1 - t0))s 才结束"; ((FAIL++))
+    fi
+
+    rc=0
+    ( PATH="/usr/bin:/bin"; _timeout_cmd 5 true ) || rc=$?
+    assert_eq "正常退出码 0 透传" "0" "$rc"
+    rc=0
+    ( PATH="/usr/bin:/bin"; _timeout_cmd 5 sh -c 'exit 3' ) || rc=$?
+    assert_eq "正常退出码 3 透传" "3" "$rc"
+}
+test_timeout_cmd_perl_fallback
+
 # ─── Summary ─────────────────────────────────────────────────
 
 echo ""
