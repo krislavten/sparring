@@ -8,7 +8,7 @@
       "name": "sparring",
       "source": "./",
       "description": "AI peer review — Claude writes, Cursor/Codex/GLM challenges",
-      "version": "2.2.0"
+      "version": "2.3.0"
     }
   ]
 }

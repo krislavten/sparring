@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.0 (2026-07-22)
+
+### 新增
+
+- `sparring review` 执行日志：每次调用追加一行 JSONL 到 `~/.local/state/sparring/review-YYYYMMDD.jsonl`（`XDG_STATE_HOME` 可覆盖），字段含 `ts` / `title` / `input_lines` / `backend`（实际使用的后端）/ `via`（primary/fallback，可见是否触发降级）/ `duration_s` / `exit_code` / `verdict`。按天分文件，写入时自动清理过期文件，默认保留 7 天（config `review.log_retention_days`，0 = 完全禁用）。日志为旁路：任何写入失败静默，不影响 review 本身。此前 ad-hoc review 输出只走 stdout 不落盘，超时/降级事后无从排查。
+
 ## 2.2.0 (2026-07-22)
 
 对应 PR #13。**含行为变更**：`sparring review` 现在默认拒绝超过 400 行的 diff。

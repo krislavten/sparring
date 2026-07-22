@@ -1687,6 +1687,139 @@ test_timeout_cmd_perl_fallback() {
 }
 test_timeout_cmd_perl_fallback
 
+echo ""
+echo "=== review 执行日志 ==="
+
+test_review_log_append_writes_jsonl() {
+    source_workflow_funcs
+    local state_home="$TMP_DIR/log-basic"
+    XDG_STATE_HOME="$state_home" _review_log_append 2 CONCERNS 'ti"tle 带"引号' 42 7 glm primary
+    local f
+    f=$(ls "$state_home/sparring"/review-*.jsonl 2>/dev/null | head -1)
+    assert_file_exists "日志文件已创建（按天命名）" "$f"
+    local line
+    line=$(tail -1 "$f")
+    assert_eq "verdict 字段" "CONCERNS" "$(echo "$line" | jq -r .verdict)"
+    assert_eq "title 引号正确转义" 'ti"tle 带"引号' "$(echo "$line" | jq -r .title)"
+    assert_eq "backend 字段" "glm" "$(echo "$line" | jq -r .backend)"
+    assert_eq "via 字段" "primary" "$(echo "$line" | jq -r .via)"
+    assert_eq "input_lines 数字" "42" "$(echo "$line" | jq -r .input_lines)"
+    assert_eq "duration_s 数字" "7" "$(echo "$line" | jq -r .duration_s)"
+    assert_eq "exit_code 数字" "2" "$(echo "$line" | jq -r .exit_code)"
+    # 追加第二行不覆盖
+    XDG_STATE_HOME="$state_home" _review_log_append 0 APPROVE t2 1 1 codex fallback
+    assert_eq "JSONL 追加不覆盖" "2" "$(wc -l < "$f" | tr -d ' ')"
+}
+test_review_log_append_writes_jsonl
+
+test_review_log_bad_numbers_fallback() {
+    source_workflow_funcs
+    local state_home="$TMP_DIR/log-badnum"
+    # 数字字段传入垃圾值也要能落一行合法 JSON，不因 jq 报错丢日志
+    XDG_STATE_HOME="$state_home" _review_log_append '' ERROR t 'x' '' '' ''
+    local f
+    f=$(ls "$state_home/sparring"/review-*.jsonl 2>/dev/null | head -1)
+    assert_file_exists "垃圾数字仍写出日志" "$f"
+    assert_eq "exit_code 兜底为 1" "1" "$(tail -1 "$f" | jq -r .exit_code)"
+    assert_eq "input_lines 兜底为 0" "0" "$(tail -1 "$f" | jq -r .input_lines)"
+    assert_eq "backend 空值兜底 unknown" "unknown" "$(tail -1 "$f" | jq -r .backend)"
+}
+test_review_log_bad_numbers_fallback
+
+test_review_log_retention_cleanup() {
+    source_workflow_funcs
+    local state_home="$TMP_DIR/log-retention"
+    local dir="$state_home/sparring"
+    mkdir -p "$dir"
+    : > "$dir/review-20200101.jsonl"
+    touch -mt 202001010000 "$dir/review-20200101.jsonl"
+    : > "$dir/other.txt"
+    touch -mt 202001010000 "$dir/other.txt"
+    XDG_STATE_HOME="$state_home" _review_log_append 0 APPROVE t 1 1 glm primary
+    if [[ -f "$dir/review-20200101.jsonl" ]]; then
+        echo "  ✗ 超过保留期的日志应被清理"; ((FAIL++))
+    else
+        echo "  ✓ 超过保留期的日志被清理"; ((PASS++))
+    fi
+    assert_file_exists "非 review-*.jsonl 文件不受清理影响" "$dir/other.txt"
+}
+test_review_log_retention_cleanup
+
+test_review_log_disabled_by_config() {
+    source_workflow_funcs
+    mkdir -p "$CONFIG_DIR_GLOBAL"
+    echo '{"review": {"log_retention_days": 0}}' > "$CONFIG_FILE_GLOBAL"
+    local state_home="$TMP_DIR/log-disabled"
+    XDG_STATE_HOME="$state_home" _review_log_append 0 APPROVE t 1 1 glm primary
+    if [[ -d "$state_home/sparring" ]]; then
+        echo "  ✗ log_retention_days=0 时不应写任何日志"; ((FAIL++))
+    else
+        echo "  ✓ log_retention_days=0 完全禁用日志"; ((PASS++))
+    fi
+    rm -f "$CONFIG_FILE_GLOBAL"
+}
+test_review_log_disabled_by_config
+
+test_call_reviewer_state_primary() {
+    source_workflow_funcs
+    # mock 后端调用成功 → 状态文件应记 primary
+    _call_backend() { echo "APPROVE mock"; }
+    local state
+    state=$(mktemp "$TMP_DIR/state.XXXXXX")
+    SPARRING_BACKEND_STATE_FILE="$state" WORKFLOW_REVIEW_BACKEND=glm \
+        call_reviewer "test prompt" "" >/dev/null 2>&1
+    assert_eq "primary 成功记录 'glm primary'" "glm primary" "$(cat "$state")"
+    unset -f _call_backend
+}
+test_call_reviewer_state_primary
+
+test_call_reviewer_state_fallback() {
+    source_workflow_funcs
+    # mock：glm 失败、codex 成功 → 状态文件按行保留完整尝试链，末行为实际后端
+    _call_backend() { [[ "$1" == "glm" ]] && return 1; echo "APPROVE mock"; }
+    local state
+    state=$(mktemp "$TMP_DIR/state.XXXXXX")
+    local rc=0
+    SPARRING_BACKEND_STATE_FILE="$state" WORKFLOW_REVIEW_BACKEND=glm \
+        WORKFLOW_REVIEW_BACKEND_FALLBACK=codex \
+        call_reviewer "test prompt" "" >/dev/null 2>&1 || rc=$?
+    assert_eq "降级成功 exit 0" "0" "$rc"
+    assert_eq "首行保留 primary 失败记录" "glm primary" "$(head -1 "$state")"
+    assert_eq "末行为实际使用的后端" "codex fallback" "$(tail -1 "$state")"
+    unset -f _call_backend
+}
+test_call_reviewer_state_fallback
+
+test_call_reviewer_state_both_fail() {
+    source_workflow_funcs
+    # mock：主备均失败 → 尝试链完整（glm primary + codex fallback），不丢主后端信息
+    _call_backend() { return 1; }
+    local state
+    state=$(mktemp "$TMP_DIR/state.XXXXXX")
+    local rc=0
+    SPARRING_BACKEND_STATE_FILE="$state" WORKFLOW_REVIEW_BACKEND=glm \
+        WORKFLOW_REVIEW_BACKEND_FALLBACK=codex \
+        call_reviewer "test prompt" "" >/dev/null 2>&1 || rc=$?
+    assert_eq "主备均失败 exit 1" "1" "$rc"
+    assert_eq "尝试链共 2 行" "2" "$(wc -l < "$state" | tr -d ' ')"
+    assert_eq "首行 primary" "glm primary" "$(head -1 "$state")"
+    assert_eq "末行 fallback" "codex fallback" "$(tail -1 "$state")"
+    unset -f _call_backend
+}
+test_call_reviewer_state_both_fail
+
+test_call_reviewer_state_unset_noop() {
+    source_workflow_funcs
+    # 未设状态文件（task 制路径）时 no-op，不报错
+    _call_backend() { echo "APPROVE mock"; }
+    local rc=0
+    unset SPARRING_BACKEND_STATE_FILE
+    WORKFLOW_REVIEW_BACKEND=glm call_reviewer "test prompt" "" >/dev/null 2>&1 || rc=$?
+    assert_eq "无状态文件时正常工作" "0" "$rc"
+    unset -f _call_backend
+}
+test_call_reviewer_state_unset_noop
+
 # ─── Summary ─────────────────────────────────────────────────
 
 echo ""
