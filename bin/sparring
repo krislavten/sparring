@@ -279,7 +279,8 @@ _config_defaults() {
     "backend": "glm",
     "fallback": null,
     "timeout": 120,
-    "retries": 1
+    "retries": 1,
+    "log_retention_days": 7
   },
   "cursor": {
     "model": null
@@ -1428,16 +1429,19 @@ call_reviewer() {
     local result rc=0
     result=$(_call_backend "$primary" "$prompt" "$task_dir") || rc=$?
     if [[ $rc -eq 0 ]]; then
+        _reviewer_state_record "$primary" primary
         echo "$result"
         return 0
     fi
 
     if [[ -z "$fallback" ]]; then
+        _reviewer_state_record "$primary" primary
         return $rc
     fi
 
     if [[ "$fallback" == "$primary" ]]; then
         echo -e "${DIM}  (fallback 与主 backend 相同: ${primary}，跳过降级)${NC}" >&2
+        _reviewer_state_record "$primary" primary
         return $rc
     fi
 
@@ -1445,14 +1449,28 @@ call_reviewer() {
     primary_label=$(reviewer_label_for_backend "$primary")
     fallback_label=$(reviewer_label_for_backend "$fallback")
     echo -e "${YELLOW}⚠ 主 backend ${primary_label} 调用失败，降级到 ${fallback_label}...${NC}" >&2
+    # 降级前先记 primary 失败，主备均失败时状态文件仍保留完整尝试链
+    _reviewer_state_record "$primary" primary
 
     if result=$(_call_backend "$fallback" "$prompt" "$task_dir"); then
+        _reviewer_state_record "$fallback" fallback
         echo "$result"
         return 0
     fi
 
+    _reviewer_state_record "$fallback" fallback
     echo -e "${RED}错误: 主备 backend 均失败 (${primary_label} → ${fallback_label})${NC}" >&2
     return 1
+}
+
+# 把本次尝试的后端和路径（primary/fallback）追加到调用方指定的状态文件，
+# 文件按行保留完整尝试链（如降级时: "glm primary" + "codex fallback"），
+# 末行即最终实际使用的后端。call_reviewer 通常在命令替换 subshell 里运行，
+# 变量传不回父进程——review_adhoc 用它拿到「实际后端 / 是否降级」写执行日志。
+# 未设置状态文件（task 制路径）时是 no-op；写失败静默，不影响 review。
+_reviewer_state_record() {
+    [[ -n "${SPARRING_BACKEND_STATE_FILE:-}" ]] || return 0
+    printf '%s %s\n' "$1" "$2" >> "$SPARRING_BACKEND_STATE_FILE" 2>/dev/null || true
 }
 
 # backward compatibility: keep old function name
@@ -1610,6 +1628,53 @@ _review_filter_diff() {
     return 0
 }
 
+# ─── review 执行日志 ─────────────────────────────────────────
+# 每次 ad-hoc review 在 ${XDG_STATE_HOME:-~/.local/state}/sparring/ 追加一行
+# JSONL（review-YYYYMMDD.jsonl，按天分文件），记录实际后端/是否降级/耗时/裁决，
+# 供事后排查「超时跑飞」「降级频率」这类问题——review 输出本身只走 stdout 不落盘。
+# config review.log_retention_days 控制保留天数（默认 7，0 = 完全禁用）。
+# 日志属于旁路：任何失败（目录建不了/jq 出错/磁盘满）都静默，绝不影响 review。
+
+_review_log_dir() {
+    printf '%s/sparring' "${XDG_STATE_HOME:-$HOME/.local/state}"
+}
+
+_review_log_retention_days() {
+    local days
+    days=$(_config_get review.log_retention_days)
+    [[ "$days" =~ ^[0-9]+$ ]] || days=7
+    printf '%s' "$days"
+}
+
+# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via>
+_review_log_append() {
+    local exit_code="$1" verdict="$2" title="$3" input_lines="$4" duration_s="$5" backend="$6" via="$7"
+    local days
+    days=$(_review_log_retention_days)
+    [[ "$days" == "0" ]] && return 0
+    local dir
+    dir=$(_review_log_dir)
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # 写入顺带清理过期日志；按文件 mtime 判断，删整文件比按行过滤简单且无半写风险
+    find "$dir" -maxdepth 1 -name 'review-*.jsonl' -type f -mtime +"$days" -delete 2>/dev/null || true
+    # 数字字段兜底成合法 JSON，避免上游异常值让 jq 报错丢日志
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+    [[ "$input_lines" =~ ^[0-9]+$ ]] || input_lines=0
+    [[ "$duration_s" =~ ^[0-9]+$ ]] || duration_s=0
+    jq -nc \
+        --arg ts "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+        --arg title "$title" \
+        --arg backend "${backend:-unknown}" \
+        --arg via "${via:-unknown}" \
+        --arg verdict "$verdict" \
+        --argjson input_lines "$input_lines" \
+        --argjson duration_s "$duration_s" \
+        --argjson exit_code "$exit_code" \
+        '{ts: $ts, title: $title, input_lines: $input_lines, backend: $backend,
+          via: $via, duration_s: $duration_s, exit_code: $exit_code, verdict: $verdict}' \
+        >> "${dir}/review-$(date +%Y%m%d).jsonl" 2>/dev/null || true
+}
+
 review_adhoc() {
     local title=""
     local content=""
@@ -1657,6 +1722,11 @@ diff 输入自带体量门禁（纯文本结论不受影响）：
   先剔除 denylist 文件段（lockfile / 构建产物 / .env / 图片字体等，
   以及 config review.exclude 数组里的 pattern），过滤后仍超预算则拒绝
   （默认 400 行——大 diff 会让 reviewer 超时跑飞，请按文件分片送审）。
+
+执行日志（排查超时/降级用）：
+  每次调用追加一行 JSONL 到 ~/.local/state/sparring/review-YYYYMMDD.jsonl
+  （字段: ts/title/input_lines/backend/via/duration_s/exit_code/verdict），
+  默认保留 7 天（config: review.log_retention_days，0 = 禁用）。
 
 选项:
   --title <主题>          审查主题，会拼在内容前
@@ -1726,9 +1796,28 @@ USAGE
     conventions=$(load_review_conventions)
     [[ -n "$conventions" ]] && content="$content"$'\n\n## Review 约定\n'"$conventions"
 
+    # 执行日志采集：送审体量、起始时间、以及实际后端状态文件
+    # （call_reviewer 在命令替换 subshell 里跑，靠文件把 backend/via 传回来）
+    local _log_lines _log_t0 _log_state
+    _log_lines=$(printf '%s' "$content" | awk 'END { print NR }')
+    _log_t0=$(date +%s)
+    _log_state=$(mktemp "${TMPDIR:-/tmp}/sparring-review-state.XXXXXX" 2>/dev/null) || _log_state=""
+    [[ -n "$_log_state" ]] && SPARRING_BACKEND_STATE_FILE="$_log_state"
+
     local result rc=0
     result=$(call_reviewer "$content" "") || rc=$?
+
+    local _log_backend="" _log_via="" _log_dur
+    if [[ -n "$_log_state" && -s "$_log_state" ]]; then
+        # 状态文件是尝试链（每行一次尝试），末行 = 最终实际使用的后端
+        read -r _log_backend _log_via <<< "$(tail -n 1 "$_log_state" 2>/dev/null)" || true
+    fi
+    [[ -n "$_log_state" ]] && rm -f "$_log_state" 2>/dev/null
+    unset SPARRING_BACKEND_STATE_FILE
+    _log_dur=$(( $(date +%s) - _log_t0 ))
+
     if [[ $rc -ne 0 ]]; then
+        _review_log_append "$rc" ERROR "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
         return $rc
     fi
 
@@ -1740,10 +1829,17 @@ USAGE
     local verdict
     verdict=$(printf '%s' "$result" | grep -m1 -oE '^(APPROVE|CONCERNS)' || true)
     case "$verdict" in
-        APPROVE)  return 0 ;;
-        CONCERNS) return 2 ;;
+        APPROVE)
+            _review_log_append 0 APPROVE "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
+            return 0
+            ;;
+        CONCERNS)
+            _review_log_append 2 CONCERNS "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
+            return 2
+            ;;
         *)
             echo -e "${YELLOW}⚠ 无法从 reviewer 输出解析出 APPROVE/CONCERNS 裁决，按调用错误处理（exit 1）${NC}" >&2
+            _review_log_append 1 ERROR "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
             return 1
             ;;
     esac
@@ -2836,7 +2932,8 @@ EOF
     "backend": "glm",
     "fallback": null,
     "timeout": 120,
-    "retries": 1
+    "retries": 1,
+    "log_retention_days": 7
   },
   "glm": {
     "api_key": "",
