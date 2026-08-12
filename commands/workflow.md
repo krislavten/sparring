@@ -1,5 +1,5 @@
 ---
-description: Execute tasks with automatic Cursor Agent peer review
+description: Execute tasks with automatic agent peer review
 argument-hint: <task-description> [claude|cursor]
 ---
 
@@ -7,11 +7,11 @@ argument-hint: <task-description> [claude|cursor]
 
 You are the **Workflow Orchestrator** managing collaboration between two AI agents with user checkpoints.
 
-Default executor is **claude** (you). Cursor Agent is the reviewer.
+Default executor is **claude** (you). The reviewer is whichever backend `review.backend` points at (claude or opencode).
 
 ## Cross-Review Principle
 
-**Before giving the user any conclusion, recommendation, or decision — get it reviewed by Cursor Agent first.**
+**Before giving the user any conclusion, recommendation, or decision — get it reviewed first.**
 
 ### MUST review (before presenting to user):
 - Technical proposals and architecture designs
@@ -40,7 +40,7 @@ response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-
 - CONCERNS: <编号列表> 如果有问题")
 ```
 
-If Cursor raises CONCERNS, reconsider your conclusion before presenting to the user. You may adjust it, or present both perspectives and let the user decide.
+If the reviewer raises CONCERNS, reconsider your conclusion before presenting to the user. You may adjust it, or present both perspectives and let the user decide.
 
 ## Workflow Phases
 
@@ -70,7 +70,7 @@ When the user invokes `/sparring:workflow <task-description> [executor]` (defaul
 #### Step 3: Auto-Review Loop (No User)
 
 4. **MUST call reviewer**: `sparring review-proposal <task-id>`
-   - Cursor Agent auto-reviews. If CONCERNS, address them and call again.
+   - The reviewer auto-reviews. If CONCERNS, address them and call again.
    - Repeat up to 5 rounds.
 
 #### Step 4: User Confirmation
@@ -84,7 +84,7 @@ When the user invokes `/sparring:workflow <task-description> [executor]` (defaul
 
 7. **Implement code** per approved proposal
 8. **MUST call reviewer**: `sparring review-code <task-id>`
-   - Cursor Agent auto-reviews code. If CONCERNS, fix and call again.
+   - The reviewer auto-reviews code. If CONCERNS, fix and call again.
    - Repeat up to 5 rounds.
 
 #### Step 6: User Final Confirmation
@@ -105,11 +105,11 @@ When the user invokes `/sparring:workflow <task-description> [executor]` (defaul
 7. **MUST call reviewer**: `sparring review-code <task-id>`
 8. **Present to user** for final approval
 
-**The reviewer steps (4 and 7) are NOT optional.** Every proposal and implementation MUST go through Cursor Agent review before presenting to the user.
+**The reviewer steps (4 and 7) are NOT optional.** Every proposal and implementation MUST go through reviewer review before presenting to the user.
 
-**Ad-hoc review**: When you want to give the user a technical recommendation or conclusion during discussion (Step 1), call Cursor Agent directly to review it before presenting. Don't skip this for significant decisions.
+**Ad-hoc review**: When you want to give the user a technical recommendation or conclusion during discussion (Step 1), run `sparring review` on it before presenting. Don't skip this for significant decisions.
 
-### When YOU are Reviewer (for Cursor's work)
+### When YOU are Reviewer (for the other agent's work)
 - **Use the `workflow` CLI** or call agent directly
 - **Parse the response** and extract concerns/approvals
 - **Don't proceed** until concerns are addressed
@@ -118,8 +118,8 @@ When the user invokes `/sparring:workflow <task-description> [executor]` (defaul
 
 **Option 1: Use the CLI (for formal proposal/code review):**
 ```bash
-sparring review-proposal <task-id>    # auto-calls agent with full context
-sparring review-code <task-id>        # auto-calls agent with diff
+sparring review-proposal <task-id>    # reviewer reads the proposal file itself
+sparring review-code <task-id>        # reviewer runs git diff itself in the project
 ```
 
 **Option 2: Call agent directly (for ad-hoc conclusion review):**
@@ -130,14 +130,14 @@ response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-
 **Important notes on calling agent:**
 - Always unset `HTTP_PROXY` and `HTTPS_PROXY` to avoid proxy issues
 - Use `--trust` for non-interactive (headless) mode
-- Model and system prompt are configured in `agents/cursor.md`
+- Backend and model are configured in `~/.config/sparring/config.json` (`review.backend`, `<backend>.model`)
 - Override model via env var: `export WORKFLOW_AGENT_MODEL=sonnet-4`
 
 ### Issue Sync Protocol
 
 When a task has an associated `issue_number` in `meta.json`, **sync key actions to the Issue as comments with identity markers**:
 
-- The `workflow` CLI auto-syncs review results (Cursor Agent reviews)
+- The `workflow` CLI auto-syncs review results (reviewer backend reviews)
 - **You (Claude) must manually sync your own actions** using:
   ```bash
   sparring issue-comment <number> "🧠 **[Claude Code — <Phase>]**
@@ -147,7 +147,7 @@ When a task has an associated `issue_number` in `meta.json`, **sync key actions 
 
 **Identity markers:**
 - `🧠 **[Claude Code — ...]**` — Claude's actions
-- `🤖 **[Cursor Agent — ...]**` — Cursor's reviews (auto-synced by CLI)
+- `🧠 **[Claude Code — ...]**` / `🛠 **[opencode (plan) — ...]**` — reviewer output (auto-synced by CLI)
 - `🔧 **[Workflow — ...]**` — status transitions (auto-synced by CLI)
 
 **When there is NO `issue_number`**: skip all sync, work purely locally.

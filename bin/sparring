@@ -26,27 +26,9 @@ _agent_attempts() {
     echo $n
 }
 # 兼容访问器（延迟求值，读当前 config）
+# reviewer 是自己跑 git/读文件的 agent，耗时以分钟计且跟送审体量不成正比
+# （审的是仓库不是一段文本），所以用扁平超时，不按内容大小加时。
 _agent_timeout() { _config_get review.timeout; }
-# 按送审内容大小自适应加时：内容越大（尤其大 diff），reviewer（推理模型）需要的时间越长，
-# 固定超时在大改动时很容易被打断（HTTP 000 / 调用错误）。以 review.timeout 为底，
-# 每 10000 字节内容加 30s，最多加 480s（默认配置下总上限 10 分钟）。
-# 不传内容时退化为纯配置值，兼容原有无参调用方（如 verify 展示）。
-ADAPTIVE_TIMEOUT_STEP_BYTES=10000
-ADAPTIVE_TIMEOUT_STEP_SECONDS=30
-ADAPTIVE_TIMEOUT_MAX_EXTRA=480
-_adaptive_timeout() {
-    local content="${1:-}"
-    local base
-    base=$(_agent_timeout)
-    [[ -z "$content" ]] && { echo "$base"; return; }
-
-    local bytes extra
-    bytes=$(printf '%s' "$content" | wc -c | tr -d ' ')
-    extra=$(( (bytes / ADAPTIVE_TIMEOUT_STEP_BYTES) * ADAPTIVE_TIMEOUT_STEP_SECONDS ))
-    [[ $extra -gt $ADAPTIVE_TIMEOUT_MAX_EXTRA ]] && extra=$ADAPTIVE_TIMEOUT_MAX_EXTRA
-
-    echo $(( base + extra ))
-}
 # Resolve symlink to find real script location
 _resolve_script_dir() {
     local src="$0"
@@ -58,14 +40,13 @@ _resolve_script_dir() {
     done
     cd -P "$(dirname "$src")/.." && pwd
 }
-AGENTS_DIR="${AGENTS_DIR:-$(_resolve_script_dir)/agents}"
-
 # GitHub Issue 配置
 ISSUE_POLL_INTERVAL="${WORKFLOW_POLL_INTERVAL:-30}"
 ISSUE_LABEL="${WORKFLOW_ISSUE_LABEL:-claude-ok}"
 ISSUE_PROJECT_NUMBER="${WORKFLOW_PROJECT_NUMBER:-}"
 ISSUE_PROJECT_OWNER="${WORKFLOW_PROJECT_OWNER:-}"
-REVIEW_BACKEND_DEFAULT="glm"
+REVIEW_BACKEND_DEFAULT="claude"
+REVIEW_BACKENDS="claude / opencode"
 
 # ─── Reviewer Backend 配置 ───────────────────────────────────
 
@@ -73,7 +54,7 @@ _normalize_backend() {
     local backend="$1"
     backend=$(printf '%s' "$backend" | tr '[:upper:]' '[:lower:]')
     case "$backend" in
-        cursor|codex|glm|claude) echo "$backend"; return 0 ;;
+        claude|opencode) echo "$backend"; return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -84,7 +65,7 @@ get_review_backend() {
     [[ -z "$raw" ]] && raw="$REVIEW_BACKEND_DEFAULT"
     local backend
     if ! backend=$(_normalize_backend "$raw"); then
-        echo -e "${RED}错误: review.backend 仅支持 cursor / codex / glm / claude${NC}" >&2
+        echo -e "${RED}错误: review.backend 仅支持 ${REVIEW_BACKENDS}${NC}" >&2
         echo "  收到: '${raw}'" >&2
         return 1
     fi
@@ -98,40 +79,25 @@ get_review_backend_fallback() {
     [[ -z "$raw" ]] && return 0
     local backend
     if ! backend=$(_normalize_backend "$raw"); then
-        echo -e "${RED}错误: review.fallback 仅支持 cursor / codex / glm / claude${NC}" >&2
+        echo -e "${RED}错误: review.fallback 仅支持 ${REVIEW_BACKENDS}${NC}" >&2
         echo "  收到: '${raw}'" >&2
         return 1
     fi
     echo "$backend"
 }
 
+# 存进 meta.json 的机器名
 reviewer_name_for_backend() {
-    local backend="$1"
-    case "$backend" in
-        cursor) echo "cursor" ;;
-        codex)  echo "codex" ;;
-        glm)    echo "glm" ;;
-        claude) echo "claude" ;;
-        *)      echo "$backend" ;;
-    esac
+    echo "$1"
 }
 
+# 给人看的展示名
 reviewer_label_for_backend() {
     local backend="$1"
     case "$backend" in
-        cursor) echo "Cursor Agent" ;;
-        codex)  echo "Codex CLI" ;;
-        glm)    echo "GLM" ;;
-        claude)
-            local mode
-            mode=$(_config_get claude.mode)
-            if [[ "$mode" == "agent" ]]; then
-                echo "Claude Code (agent)"
-            else
-                echo "Claude Code"
-            fi
-            ;;
-        *)      echo "$backend" ;;
+        claude)   echo "Claude Code" ;;
+        opencode) echo "opencode (plan)" ;;
+        *)        echo "$backend" ;;
     esac
 }
 
@@ -183,57 +149,29 @@ check_deps() {
     fi
 }
 
-check_agent() {
-    if ! command -v agent &>/dev/null; then
-        echo -e "${RED}错误: 未找到 agent 命令 (Cursor CLI)${NC}" >&2
-        echo "  请安装: https://docs.cursor.com/cli" >&2
-        return 1
-    fi
-}
-
-check_codex() {
-    if ! command -v codex &>/dev/null; then
-        echo -e "${RED}错误: 未找到 codex 命令${NC}" >&2
-        echo "  请安装: npm install -g @openai/codex" >&2
-        return 1
-    fi
-}
-
-check_glm() {
-    if ! command -v curl &>/dev/null; then
-        echo -e "${RED}错误: 未找到 curl 命令${NC}" >&2
-        return 1
-    fi
-    local key
-    key=$(_config_get glm.api_key)
-    if [[ -z "$key" ]]; then
-        echo -e "${RED}错误: 未配置 glm.api_key${NC}" >&2
-        echo "  方式1: sparring config init 写入 ~/.config/sparring/config.json" >&2
-        echo "  方式2: export SPARRING_GLM_API_KEY=<id.secret>" >&2
-        echo "  获取: https://open.bigmodel.cn/usercenter/apikeys" >&2
-        return 1
-    fi
-}
-
 check_claude() {
     if ! command -v claude &>/dev/null; then
         echo -e "${RED}错误: 未找到 claude 命令 (Claude Code CLI)${NC}" >&2
         echo "  请安装: npm install -g @anthropic-ai/claude-code" >&2
         return 1
     fi
-    # 第三方模型路径（配了 base_url）必须有 api_key；原生路径走 OAuth 登录，不强制
-    local base_url key
-    base_url=$(_config_get claude.base_url)
-    if [[ -n "$base_url" ]]; then
-        key=$(_config_get claude.api_key)
-        if [[ -z "$key" ]]; then
-            echo -e "${RED}错误: 配置了 claude.base_url 必须同时配 claude.api_key${NC}" >&2
-            echo "  方式1: sparring config init 写入 ~/.config/sparring/config.json" >&2
-            echo "  方式2: export SPARRING_CLAUDE_API_KEY=<token>" >&2
-            echo "  (第三方端点用 token 鉴权；留空 base_url 则走本机已登录的 Claude Code)" >&2
-            return 1
-        fi
+}
+
+check_opencode() {
+    if ! command -v opencode &>/dev/null; then
+        echo -e "${RED}错误: 未找到 opencode 命令${NC}" >&2
+        echo "  请安装: https://opencode.ai/docs" >&2
+        return 1
     fi
+}
+
+# 后端可用性检查（每个后端一个 check_<backend>）
+check_backend() {
+    case "$1" in
+        claude)   check_claude ;;
+        opencode) check_opencode ;;
+        *)        echo -e "${RED}错误: 不支持的 reviewer backend: $1${NC}" >&2; return 1 ;;
+    esac
 }
 
 # ─── 项目根目录查找（向上查找 .workflow 或 .git） ──────────
@@ -276,34 +214,19 @@ _config_defaults() {
     cat <<'EOF'
 {
   "review": {
-    "backend": "glm",
-    "fallback": null,
-    "timeout": 120,
+    "backend": "claude",
+    "fallback": "opencode",
+    "timeout": 600,
     "retries": 1,
     "log_retention_days": 7
   },
-  "cursor": {
-    "model": null
-  },
-  "codex": {
-    "model": null,
-    "effort": null,
-    "home": null
-  },
-  "glm": {
-    "api_key": null,
-    "model": "glm-5.1",
-    "thinking": "disabled",
-    "max_tokens": 8192,
-    "temperature": 0.3,
-    "api_base": "https://open.bigmodel.cn/api/paas/v4"
-  },
   "claude": {
-    "mode": "diff",
     "model": null,
-    "base_url": null,
-    "api_key": null,
-    "config_dir": null,
+    "use_proxy": false,
+    "extra_args": null
+  },
+  "opencode": {
+    "model": null,
     "use_proxy": false,
     "extra_args": null
   }
@@ -360,7 +283,7 @@ _env_name_for_path() {
 # _config_get <key.path>
 # 优先级：SPARRING_<KEY> > WORKFLOW_<KEY>（兼容） > project > global > default
 # Usage: _config_get review.backend
-#        _config_get glm.api_key
+#        _config_get claude.model
 _config_get() {
     local path="$1"
     [[ -z "$path" ]] && { echo ""; return 0; }
@@ -404,9 +327,6 @@ _workflow_legacy_alias() {
         review.fallback)
             [[ -n "${WORKFLOW_REVIEW_BACKEND_FALLBACK:-}" ]] && { printf '%s' "$WORKFLOW_REVIEW_BACKEND_FALLBACK"; return 0; }
             ;;
-        cursor.model)
-            [[ -n "${WORKFLOW_AGENT_MODEL:-}" ]] && { printf '%s' "$WORKFLOW_AGENT_MODEL"; return 0; }
-            ;;
     esac
     return 1
 }
@@ -415,7 +335,7 @@ REVIEW_JOBS_DIR="${WORKFLOW_DIR}/review-jobs"
 
 # ─── Review 约定 (.sparring/REVIEW.md) ──────────────────────
 # 查找顺序：项目级 → 全局 → 空字符串
-# 注入到所有 reviewer prompt 中（diff 模式内联；agent 模式通过 --add-dir 也能自行读取）
+# 内联进 reviewer prompt（reviewer 的 cwd 里也能读到项目级那份，但全局那份只有这条路径能给它）
 load_review_conventions() {
     local project_file="${CONFIG_DIR_PROJECT}/REVIEW.md"
     local global_file="${CONFIG_DIR_GLOBAL}/REVIEW.md"
@@ -834,7 +754,7 @@ cancel_review_job() {
 
 # 如果任务关联了 issue，同步 comment（带身份标记）
 # Usage: sync_to_issue <task_dir> <agent_name> <phase_label> <body>
-# Example: sync_to_issue "$task_dir" "Cursor Agent" "Proposal Review" "$review_result"
+# Example: sync_to_issue "$task_dir" "Claude Code" "Proposal Review" "$review_result"
 sync_to_issue() {
     local task_dir="$1"
     local agent_name="$2"
@@ -849,11 +769,9 @@ sync_to_issue() {
 
     local icon
     case "$agent_name" in
-        *Claude*|*claude*) icon="🧠" ;;
-        *Cursor*|*cursor*) icon="🤖" ;;
-        *Codex*|*codex*)   icon="🧪" ;;
-        *GLM*|*glm*)       icon="🌟" ;;
-        *)                 icon="🔧" ;;
+        *Claude*|*claude*)     icon="🧠" ;;
+        *opencode*|*Opencode*) icon="🛠" ;;
+        *)                     icon="🔧" ;;
     esac
 
     local comment="${icon} **[${agent_name} — ${phase_label}]**
@@ -863,47 +781,6 @@ ${body}"
     gh issue comment "$issue_number" --repo "$repo" --body "$comment" >/dev/null 2>&1 || {
         echo -e "${DIM}  (Issue 同步失败，继续本地流程)${NC}" >&2
     }
-}
-
-# ─── Agent 配置加载 ─────────────────────────────────────────
-
-# 从 agents/<name>.md 读取配置
-# 解析 model 和 system prompt
-load_agent_config() {
-    local agent_name="$1"
-    local config_file="${AGENTS_DIR}/${agent_name}.md"
-
-    AGENT_MODEL=""
-    AGENT_SYSTEM_PROMPT=""
-
-    if [[ ! -f "$config_file" ]]; then
-        echo -e "${DIM}  未找到 agent 配置: ${config_file}，使用默认值${NC}" >&2
-        AGENT_MODEL="gpt-5.5-extra-high"
-        return 0
-    fi
-
-    # 解析 model: 从 "model: xxx" 行提取
-    AGENT_MODEL=$(grep -E '^model:' "$config_file" | head -1 | sed 's/^model:[[:space:]]*//')
-    if [[ -z "$AGENT_MODEL" ]]; then
-        AGENT_MODEL="gpt-5.5-extra-high"
-    fi
-
-    # 解析 system prompt: ## System Prompt 之后的所有内容
-    local in_prompt=false
-    local prompt_lines=()
-    while IFS= read -r line; do
-        if [[ "$in_prompt" == true ]]; then
-            prompt_lines+=("$line")
-        elif [[ "$line" == "## System Prompt" ]]; then
-            in_prompt=true
-        fi
-    done < "$config_file"
-
-    if [[ ${#prompt_lines[@]} -gt 0 ]]; then
-        AGENT_SYSTEM_PROMPT=$(printf '%s\n' "${prompt_lines[@]}")
-        # 去掉开头的空行
-        AGENT_SYSTEM_PROMPT=$(echo "$AGENT_SYSTEM_PROMPT" | sed '/./,$!d')
-    fi
 }
 
 # ─── Agent 调用封装 ──────────────────────────────────────────
@@ -947,122 +824,25 @@ _timeout_cmd() {
     fi
 }
 
-# 为任务初始化 cursor agent session（创建 chat 并存到 meta.json）
-init_agent_session() {
-    local task_dir="$1"
-    local backend
-    backend=$(get_review_backend) || return 1
+# ─── Reviewer 角色 prompt ────────────────────────────────────
+# 两个后端共用。裁决格式是硬契约（上层按首列 APPROVE/CONCERNS 定退出码），
+# 改这段等于改 sparring 的对外行为。
+_reviewer_role_prompt() {
+    cat <<'ROLEEOF'
+你是严格的 code reviewer，工作在一个双 AI 协作流程里：搭档负责写，你负责挑毛病。
 
-    # codex backend 不需要 cursor chat session
-    [[ "$backend" != "cursor" ]] && return 0
+原则:
+- 先理解再评判：看懂改动在整个项目里的位置和影响，再开口。
+- 不讨好不客套：没问题就一句 APPROVE，别写"整体不错，但是"。
+- 只提当前改动的真实问题：不提远期优化，不为假设性场景加防御，不凭空建议加抽象层。
+- 关注正确性、边界情况、并发与资源泄漏、安全、错误处理、测试是否覆盖真实失败路径。
+- 没把握时宁可提 CONCERNS，但每条都要说清"为什么这是本次改动的真实问题"。
 
-    check_agent || return 1
-
-    local chat_id
-    chat_id=$(HTTP_PROXY= HTTPS_PROXY= agent create-chat 2>/dev/null)
-
-    if [[ -n "$chat_id" ]]; then
-        update_meta "$task_dir" --arg cid "$chat_id" '.agent_chat_id = $cid'
-        echo -e "${DIM}  已创建 Cursor Agent session: ${chat_id}${NC}" >&2
-    else
-        echo -e "${DIM}  无法创建 agent session，将使用独立会话${NC}" >&2
-    fi
-}
-
-call_cursor_agent() {
-    local prompt="$1"
-    local task_dir="${2:-}"
-    local result=""
-
-    check_agent || return 1
-
-    # 加载 cursor agent 配置
-    load_agent_config "cursor"
-
-    # 如果有 system prompt，拼到 prompt 前面
-    if [[ -n "$AGENT_SYSTEM_PROMPT" ]]; then
-        prompt="<system>
-${AGENT_SYSTEM_PROMPT}
-</system>
-
-${prompt}"
-    fi
-
-    # 配置优先级: env (SPARRING_AGENT_MODEL / WORKFLOW_AGENT_MODEL) > config > agents/cursor.md
-    local model
-    model=$(_config_get cursor.model)
-    [[ -z "$model" ]] && model="$AGENT_MODEL"
-
-    # 读取 chat_id 用于 resume
-    local chat_id=""
-    if [[ -n "$task_dir" && -f "${task_dir}/meta.json" ]]; then
-        chat_id=$(jq -r '.agent_chat_id // empty' "${task_dir}/meta.json")
-    fi
-
-    local resume_args=()
-    if [[ -n "$chat_id" ]]; then
-        resume_args=(--resume "$chat_id")
-        echo -e "${DIM}  使用模型: ${model} | 恢复会话: ${chat_id:0:8}...${NC}" >&2
-    else
-        echo -e "${DIM}  使用模型: ${model} | 新会话${NC}" >&2
-    fi
-
-    local max_attempts
-    max_attempts=$(_agent_attempts)
-
-    for i in $(seq 1 $max_attempts); do
-        if [[ ${#resume_args[@]} -gt 0 ]]; then
-            result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_adaptive_timeout "$prompt")" \
-                agent --print --trust --model "$model" "${resume_args[@]}" "$prompt" 2>&1) && break
-        else
-            result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$(_adaptive_timeout "$prompt")" \
-                agent --print --trust --model "$model" "$prompt" 2>&1) && break
-        fi
-
-        if [[ $i -lt $max_attempts ]]; then
-            echo -e "${DIM}  agent 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
-            sleep 2
-        else
-            echo -e "${RED}错误: agent 调用失败 (共 $max_attempts 次尝试)${NC}" >&2
-            echo -e "${DIM}  错误信息: $result${NC}" >&2
-            echo ""
-            return 1
-        fi
-    done
-
-    echo "$result"
-}
-
-call_codex_agent() {
-    local prompt="$1"
-    local max_attempts
-    max_attempts=$(_agent_attempts)
-    local result=""
-
-    check_codex || return 1
-
-    local model effort codex_home
-    model=$(_config_get codex.model)
-    effort=$(_config_get codex.effort)
-    codex_home=$(_config_get codex.home)
-    [[ -z "$codex_home" ]] && codex_home="${TMPDIR:-/tmp}/workflow-codex-home-${USER:-user}"
-    mkdir -p "$codex_home"
-
-    local output_file
-    output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-codex-out.XXXXXX")
-    local prompt_file
-    prompt_file=$(mktemp "${TMPDIR:-/tmp}/workflow-codex-prompt.XXXXXX")
-    local command_output_file
-    command_output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-codex-log.XXXXXX")
-
-    cat > "$prompt_file" <<EOF
-你在 Dual AI Workflow 中担任严格 reviewer。
-
-响应格式必须严格二选一：
+响应格式必须严格二选一（首行就是裁决词，前面不加任何字符）：
 1) 通过时：
 APPROVE
 
-[1-2 句理由]
+[1-2 句理由，说清你验证了什么]
 
 2) 有问题时：
 CONCERNS
@@ -1071,363 +851,138 @@ CONCERNS
 2. ...
 
 始终用中文，且不要输出其他格式。
-
-${prompt}
-EOF
-
-    local codex_cmd=(codex exec --sandbox read-only --ephemeral --skip-git-repo-check --color never --output-last-message "$output_file")
-    if [[ -n "$model" ]]; then
-        codex_cmd+=(--model "$model")
-    fi
-    if [[ -n "$effort" ]]; then
-        codex_cmd+=(-c "model_reasoning_effort=\"$effort\"")
-    fi
-    codex_cmd+=(-)
-
-    local model_desc="${model:-default(config.toml)}"
-    local effort_desc="${effort:-default(config.toml)}"
-    echo -e "${DIM}  使用 Codex CLI | 模型: ${model_desc} | 推理: ${effort_desc}${NC}" >&2
-    echo -e "${DIM}  CODEX_HOME: ${codex_home}${NC}" >&2
-
-    for i in $(seq 1 $max_attempts); do
-        if HTTP_PROXY= HTTPS_PROXY= CODEX_HOME="$codex_home" _timeout_cmd "$(_adaptive_timeout "$prompt")" \
-            "${codex_cmd[@]}" < "$prompt_file" > "$command_output_file" 2>&1; then
-            break
-        fi
-
-        if [[ $i -lt $max_attempts ]]; then
-            echo -e "${DIM}  codex 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
-            sleep 2
-        else
-            local err_output
-            err_output=$(cat "$command_output_file" 2>/dev/null || true)
-            rm -f "$output_file" "$prompt_file" "$command_output_file"
-            echo -e "${RED}错误: codex 调用失败 (共 $max_attempts 次尝试)${NC}" >&2
-            echo -e "${DIM}  错误信息: $err_output${NC}" >&2
-            echo ""
-            return 1
-        fi
-    done
-
-    if [[ -s "$output_file" ]]; then
-        result=$(cat "$output_file")
-    else
-        result=$(cat "$command_output_file" 2>/dev/null || true)
-    fi
-
-    # 忽略 codex CLI 的 PATH 警告噪音
-    result=$(echo "$result" | sed '/^WARNING: proceeding, even though we could not update PATH:/d')
-
-    rm -f "$output_file" "$prompt_file" "$command_output_file"
-
-    if [[ "$result" != *[![:space:]]* ]]; then
-        echo -e "${RED}错误: codex 返回空结果${NC}" >&2
-        return 1
-    fi
-
-    echo "$result"
+ROLEEOF
 }
 
-call_glm_agent() {
-    local prompt="$1"
-    local max_attempts
-    max_attempts=$(_agent_attempts)
+# ─── 后端命令组装 ───────────────────────────────────────────
+# 每个后端只管"命令长什么样"；超时、重试、输出清洗、裁决解析都在 _call_backend 里共用。
+# 结果写进全局数组 AGENT_CMD（bash 3.2 没法从函数返回数组）。
 
-    check_glm || return 1
-
-    local api_base model thinking max_tokens temperature api_key
-    api_base=$(_config_get glm.api_base)
-    model=$(_config_get glm.model)
-    thinking=$(_config_get glm.thinking)
-    max_tokens=$(_config_get glm.max_tokens)
-    temperature=$(_config_get glm.temperature)
-    api_key=$(_config_get glm.api_key)
-
-    # 把 reviewer 指令前缀拼到用户 prompt，跟 codex 分支对齐
-    local full_prompt="你在 Dual AI Workflow 中担任严格 reviewer。
-
-响应格式必须严格二选一：
-1) 通过时：
-APPROVE
-
-[1-2 句理由]
-
-2) 有问题时：
-CONCERNS
-
-1. [问题 + 影响 + 修复建议]
-2. ...
-
-始终用中文，且不要输出其他格式。
-
-${prompt}"
-
-    echo -e "${DIM}  使用 GLM | 模型: ${model} | thinking: ${thinking}${NC}" >&2
-
-    local payload
-    payload=$(jq -n \
-        --arg model "$model" \
-        --arg content "$full_prompt" \
-        --arg thinking "$thinking" \
-        --argjson max_tokens "$max_tokens" \
-        --argjson temperature "$temperature" \
-        '{
-            model: $model,
-            messages: [{role: "user", content: $content}],
-            thinking: {type: $thinking},
-            max_tokens: $max_tokens,
-            temperature: $temperature
-        }')
-
-    local response_file
-    response_file=$(mktemp "${TMPDIR:-/tmp}/workflow-glm.XXXXXX")
-    local http_status=""
-    local result=""
-
-    local call_timeout
-    call_timeout=$(_adaptive_timeout "$full_prompt")
-
-    for i in $(seq 1 $max_attempts); do
-        http_status=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd "$call_timeout" \
-            curl -sS -w '%{http_code}' -o "$response_file" \
-                --connect-timeout 10 \
-                --max-time "$call_timeout" \
-                -X POST "${api_base}/chat/completions" \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer ${api_key}" \
-                -d "$payload" 2>/dev/null) || http_status="000"
-
-        if [[ "$http_status" == "200" ]]; then
-            break
-        fi
-
-        if [[ $i -lt $max_attempts ]]; then
-            echo -e "${DIM}  glm 调用失败 (HTTP ${http_status})，重试 ($i/$max_attempts)...${NC}" >&2
-            sleep 2
-        else
-            local body
-            body=$(cat "$response_file" 2>/dev/null | head -c 300)
-            rm -f "$response_file"
-            echo -e "${RED}错误: glm 调用失败 (HTTP ${http_status}, 共 ${max_attempts} 次尝试)${NC}" >&2
-            [[ -n "$body" ]] && echo -e "${DIM}  响应: ${body}${NC}" >&2
-            return 1
-        fi
-    done
-
-    # GLM 响应：choices[0].message.content；空字符串时不应兜底到 reasoning_content
-    # （reasoning 不遵守 APPROVE/CONCERNS 格式，会让上层解析失败）
-    result=$(jq -r '.choices[0].message.content // empty' "$response_file" 2>/dev/null)
-    if [[ "$result" != *[![:space:]]* ]]; then
-        # content 为空字符串时，jq `//` 不会回退，手动检查 reasoning 提示用户调参
-        local has_reasoning
-        has_reasoning=$(jq -r '(.choices[0].message.reasoning_content // "") | length > 0' "$response_file" 2>/dev/null)
-        rm -f "$response_file"
-        if [[ "$has_reasoning" == "true" ]]; then
-            echo -e "${RED}错误: glm 返回空 content（finish_reason 可能是 length — reasoning 吃完了 max_tokens）${NC}" >&2
-            echo -e "${DIM}  建议: 调大 glm.max_tokens 到 65536 或关闭 glm.thinking${NC}" >&2
-        else
-            echo -e "${RED}错误: glm 返回空 content${NC}" >&2
-        fi
-        return 1
-    fi
-    rm -f "$response_file"
-
-    echo "$result"
+_agent_cmd_claude() {
+    local model="$1"
+    AGENT_CMD=(claude -p --output-format text)
+    [[ -n "$model" ]] && AGENT_CMD+=(--model "$model")
+    # Bash 必须显式预批：-p 是非交互的，没预批的工具会被直接拒（不是挂起等人点同意），
+    # reviewer 跑不了 git diff 就只能盲审。实测本机 ~/.claude 已放行 Bash 时不加也能跑，
+    # 但不能指望每台机器的用户配置都这样。
+    AGENT_CMD+=(--allowedTools "Bash Read Grep Glob")
+    # 写类和联网工具一律禁掉。注意这只挡工具本身：Bash 仍能写文件，
+    # 快照的"只读"靠的是审完就删，不是文件系统权限。
+    AGENT_CMD+=(--disallowedTools "Edit Write NotebookEdit Task WebFetch WebSearch")
 }
 
-# 通过 Claude Code CLI（claude -p 非交互打印模式）做 review。
-# 两种用法：
-#   原生 Claude   — base_url 留空，复用本机已登录的 Claude Code（OAuth / ANTHROPIC_API_KEY）
-#   第三方模型    — 设 claude.base_url + api_key + model 指向各家 Anthropic 兼容端点（GLM / DeepSeek...）
-# 两种模式（claude.mode）：
-#   diff  （默认）— 禁全部工具，prompt 含静态 diff 文本；任何 base_url 端点均可用
-#   agent          — 开放只读工具（Read/Grep/Glob）+ --add-dir 挂载 PROJECT_ROOT；
-#                    reviewer 自主探索仓库文件上下文；Bash 仍禁用（防 prompt injection）；
-#                    仅原生 claude CLI 支持（base_url 设置时自动降级 diff）
-# 关键隔离：
-#   - 强制在 mktemp 空目录里运行 → 阻断 cwd 向上的项目 CLAUDE.md 注入
-#   - 第三方路径用全新空 config_dir → 连全局 CLAUDE.md + 残留登录态一并隔离
-#   - diff 模式禁全部 agentic 工具 → 单发纯文本裁决，递归结构上不可能
-#   - agent 模式禁写类工具 + Bash（Edit/Write/NotebookEdit/Task/WebFetch/WebSearch/Bash）
-#   - agent 模式失败时自动降级到 diff 模式重试一次
-call_claude_agent() {
-    local prompt="$1"
-    local max_attempts
-    max_attempts=$(_agent_attempts)
-    local result=""
-
-    check_claude || return 1
-
-    local mode model base_url api_key config_dir use_proxy extra_args
-    mode=$(_config_get claude.mode)
-    model=$(_config_get claude.model)
-    base_url=$(_config_get claude.base_url)
-    api_key=$(_config_get claude.api_key)
-    config_dir=$(_config_get claude.config_dir)
-    use_proxy=$(_config_get claude.use_proxy)
-    extra_args=$(_config_get claude.extra_args)
-
-    # agent 模式依赖原生 claude 工具访问；第三方端点无法使用 → 静默降级
-    [[ "$mode" == "agent" && -n "$base_url" ]] && {
-        echo -e "${DIM}  (claude.mode=agent 与 base_url 不兼容，降级到 diff 模式)${NC}" >&2
-        mode="diff"
-    }
-
-    # ── 隔离 config dir ──
-    local ephemeral_cfg=""
-    if [[ -n "$config_dir" ]]; then
-        :                                       # 用户显式指定（如预登录的干净目录）
-    elif [[ -n "$base_url" ]]; then
-        # 第三方路径：env token 鉴权，不依赖登录态 → 全新空目录（内无 .credentials.json）
-        config_dir=$(mktemp -d "${TMPDIR:-/tmp}/sparring-claude-cfg.XXXXXX")
-        ephemeral_cfg="$config_dir"
-    else
-        config_dir="$HOME/.claude"              # 原生路径：复用用户登录态
-    fi
-    # 强制空 cwd（杀 cwd 向上的项目 CLAUDE.md，对两条路径都生效）
-    local run_cwd
-    run_cwd=$(mktemp -d "${TMPDIR:-/tmp}/sparring-claude-cwd.XXXXXX")
-
-    local prompt_file output_file log_file
-    prompt_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-prompt.XXXXXX")
-    output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-out.XXXXXX")
-    log_file=$(mktemp "${TMPDIR:-/tmp}/workflow-claude-log.XXXXXX")
-
-    # ── 组装 env ──
-    local -a envs=("CLAUDE_CONFIG_DIR=$config_dir")
-    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
-    if [[ -n "$base_url" ]]; then               # 第三方模型路径
-        envs+=("ANTHROPIC_BASE_URL=$base_url")
-        envs+=("ANTHROPIC_AUTH_TOKEN=$api_key")
-        envs+=("ANTHROPIC_API_KEY=")            # 清空 env 残留；叠加全新空 config dir(无 .credentials) 双保险
-        [[ -n "$model" ]] && envs+=("ANTHROPIC_MODEL=$model")
-    fi
-
-    local model_desc="${model:-default(已登录账号)}"
-    local route_desc="原生 Claude"
-    [[ -n "$base_url" ]] && route_desc="第三方端点 ${base_url}"
-
-    # 清理：每个 return 前显式 rm（mirror codex/glm）。不用 trap RETURN ——
-    # 本函数在 result=$(_call_backend ...) 子 shell 里跑且脚本 set -u；RETURN trap 是全局状态，
-    # 会在外层 _call_backend/call_reviewer 返回时再次触发，那里 $_cleanup 未定义 → unbound variable。
-    # 也不用 EXIT trap（见 line 309）。_timeout_cmd 超时是 SIGKILL 子进程 claude，本函数仍正常走到下方清理。
-    local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\"; rm -rf \"$run_cwd\""
-    [[ -n "$ephemeral_cfg" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cfg\""
-
-    # ── 内部执行函数：写 prompt 文件并运行 claude，输出到 output_file ──
-    # 参数：$1=effective_mode  $2=prompt_text
-    _run_claude_once() {
-        local eff_mode="$1" eff_prompt="$2"
-
-        cat > "$prompt_file" <<EOF
-你在 Dual AI Workflow 中担任严格 reviewer。
-
-响应格式必须严格二选一：
-1) 通过时：
-APPROVE
-
-[1-2 句理由]
-
-2) 有问题时：
-CONCERNS
-
-1. [问题 + 影响 + 修复建议]
-2. ...
-
-始终用中文，且不要输出其他格式。
-
-${eff_prompt}
-EOF
-
-        local -a cmd=(claude -p --output-format text)
-        [[ -n "$model" ]] && cmd+=(--model "$model")
-
-        if [[ "$eff_mode" == "agent" ]]; then
-            # 开放只读工具（Read/Grep/Glob），挂载 PROJECT_ROOT 供探索。
-            # Bash 显式禁用：reviewer 不需要执行命令，且禁 Bash 可防止 diff 内
-            # prompt injection 借 Bash 执行任意系统命令（rm/curl 等）。
-            cmd+=(--add-dir "$PROJECT_ROOT")
-            cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Task WebFetch WebSearch")
-        else
-            # diff 模式：禁全部 agentic 工具，纯文本单发
-            # 主防线：-p 不带 --dangerously-skip-permissions → 新工具默认挡
-            # 兜底：--disallowedTools 显式列出
-            cmd+=(--disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task")
-        fi
-
-        # shellcheck disable=SC2206
-        [[ -n "$extra_args" ]] && cmd+=($extra_args)
-
-        echo -e "${DIM}  使用 Claude Code (${eff_mode} 模式) | 模型: ${model_desc} | 路由: ${route_desc}${NC}" >&2
-        echo -e "${DIM}  CLAUDE_CONFIG_DIR: ${config_dir}${NC}" >&2
-
-        ( cd "$run_cwd" && _timeout_cmd "$(_adaptive_timeout "$eff_prompt")" \
-            env "${envs[@]}" "${cmd[@]}" \
-            < "$prompt_file" > "$output_file" 2>"$log_file" )
-    }
-
-    # ── 执行（含重试逻辑）──
-    local i
-    for i in $(seq 1 $max_attempts); do
-        if _run_claude_once "$mode" "$prompt"; then
-            break
-        fi
-
-        if [[ $i -lt $max_attempts ]]; then
-            echo -e "${DIM}  claude 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
-            sleep 2
-        else
-            # agent 模式失败 → 降级 diff 重试一次（diff 模式直接报错）
-            if [[ "$mode" == "agent" ]]; then
-                echo -e "${YELLOW}⚠ agent 模式调用失败，降级到 diff 模式重试...${NC}" >&2
-                if _run_claude_once "diff" "$prompt"; then
-                    break
-                fi
-            fi
-            local err_output
-            err_output=$(cat "$log_file" 2>/dev/null | tail -c 400 || true)
-            eval "$_cleanup"
-            echo -e "${RED}错误: claude 调用失败 (共 $max_attempts 次尝试)${NC}" >&2
-            [[ -n "$err_output" ]] && echo -e "${DIM}  错误信息: $err_output${NC}" >&2
-            return 1
-        fi
-    done
-
-    result=$(cat "$output_file" 2>/dev/null || true)
-    eval "$_cleanup"
-
-    if [[ "$result" != *[![:space:]]* ]]; then
-        echo -e "${RED}错误: claude 返回空结果${NC}" >&2
-        return 1
-    fi
-
-    echo "$result"
+_agent_cmd_opencode() {
+    local model="$1"
+    # plan agent 默认就不带编辑能力，所以绝不能加 --auto。用户 shell 里 opencode 是个带
+    # --auto 的 alias —— 脚本非交互执行不吃 alias，下面又统一经 env 直接 exec 二进制，天然绕开。
+    AGENT_CMD=(opencode run --agent plan)
+    [[ -n "$model" ]] && AGENT_CMD+=(-m "$model")
 }
 
-# 底层：调用指定 backend
+# 剥掉 agent CLI 的终端噪音：ANSI 序列 + "> plan · model" 这类进度头行。
+# 实测重定向时 opencode 把它们写 stderr、stdout 干净，但接 TTY 时会混进来；
+# 裁决是首列严格匹配，混进一个 ESC 序列就解析不出来。
+_strip_agent_noise() {
+    local esc=$'\033'
+    sed -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" -e "s/${esc}//g" -e '/^> .* · /d' -e '/./,$!d'
+}
+
+# _call_backend <backend> <prompt> [run_cwd]
+# 在 run_cwd 里跑指定后端的 reviewer agent，裁决文本打到 stdout。
+# prompt 一律走 stdin（两个 CLI 都支持），避免大 prompt 撞 ARG_MAX。
+# run_cwd 决定 reviewer 能看到什么：range 审查传只读快照，纯文本审查留空 → 临时空目录。
 _call_backend() {
     local backend="$1"
     local prompt="$2"
-    local task_dir="${3:-}"
+    local run_cwd="${3:-}"
 
+    check_backend "$backend" || return 1
+
+    local model use_proxy extra_args
+    model=$(_config_get "${backend}.model")
+    use_proxy=$(_config_get "${backend}.use_proxy")
+    extra_args=$(_config_get "${backend}.extra_args")
+
+    local ephemeral_cwd=""
+    if [[ -z "$run_cwd" ]]; then
+        run_cwd=$(mktemp -d "${TMPDIR:-/tmp}/sparring-review-cwd.XXXXXX")
+        ephemeral_cwd="$run_cwd"
+    fi
+
+    AGENT_CMD=()
     case "$backend" in
-        cursor) call_cursor_agent "$prompt" "$task_dir" ;;
-        codex)  call_codex_agent "$prompt" "$task_dir" ;;
-        glm)    call_glm_agent "$prompt" "$task_dir" ;;
-        claude) call_claude_agent "$prompt" "$task_dir" ;;
-        *)      echo -e "${RED}错误: 不支持的 reviewer backend: ${backend}${NC}" >&2; return 1 ;;
+        claude)   _agent_cmd_claude "$model" ;;
+        opencode) _agent_cmd_opencode "$model" ;;
     esac
+    # shellcheck disable=SC2206  # 有意按空格拆成多个参数
+    [[ -n "$extra_args" ]] && AGENT_CMD+=($extra_args)
+
+    local -a envs=()
+    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+
+    local prompt_file output_file log_file
+    prompt_file=$(mktemp "${TMPDIR:-/tmp}/sparring-prompt.XXXXXX")
+    output_file=$(mktemp "${TMPDIR:-/tmp}/sparring-out.XXXXXX")
+    log_file=$(mktemp "${TMPDIR:-/tmp}/sparring-log.XXXXXX")
+    { _reviewer_role_prompt; printf '\n%s\n' "$prompt"; } > "$prompt_file"
+
+    # 清理：每个 return 前显式 rm。不用 trap RETURN —— 本函数在
+    # result=$(_call_backend ...) 子 shell 里跑且脚本 set -u；RETURN trap 是全局状态，
+    # 会在外层 call_reviewer 返回时再次触发，那里 $_cleanup 未定义 → unbound variable。
+    local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\""
+    [[ -n "$ephemeral_cwd" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cwd\""
+
+    local label timeout_s max_attempts
+    label=$(reviewer_label_for_backend "$backend")
+    timeout_s=$(_agent_timeout)
+    max_attempts=$(_agent_attempts)
+    echo -e "${DIM}  使用 ${label} | 模型: ${model:-default} | 工作目录: ${run_cwd}${NC}" >&2
+
+    local i ok=false
+    for i in $(seq 1 "$max_attempts"); do
+        if ( cd "$run_cwd" && _timeout_cmd "$timeout_s" \
+                env ${envs[@]+"${envs[@]}"} "${AGENT_CMD[@]}" \
+                < "$prompt_file" > "$output_file" 2>"$log_file" ); then
+            ok=true
+            break
+        fi
+        if [[ $i -lt $max_attempts ]]; then
+            echo -e "${DIM}  ${backend} 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
+            sleep 2
+        fi
+    done
+
+    if [[ "$ok" != true ]]; then
+        local err_output
+        err_output=$(tail -c 400 "$log_file" 2>/dev/null || true)
+        eval "$_cleanup"
+        echo -e "${RED}错误: ${backend} 调用失败 (共 ${max_attempts} 次尝试)${NC}" >&2
+        [[ -n "$err_output" ]] && echo -e "${DIM}  错误信息: ${err_output}${NC}" >&2
+        return 1
+    fi
+
+    local result
+    result=$(_strip_agent_noise < "$output_file")
+    eval "$_cleanup"
+
+    if [[ "$result" != *[![:space:]]* ]]; then
+        echo -e "${RED}错误: ${backend} 返回空结果${NC}" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$result"
 }
 
+# call_reviewer <prompt> [run_cwd]
 call_reviewer() {
     local prompt="$1"
-    local task_dir="${2:-}"
+    local run_cwd="${2:-}"
     local primary fallback
     primary=$(get_review_backend) || return 1
     fallback=$(get_review_backend_fallback) || return 1
 
     local result rc=0
-    result=$(_call_backend "$primary" "$prompt" "$task_dir") || rc=$?
+    result=$(_call_backend "$primary" "$prompt" "$run_cwd") || rc=$?
     if [[ $rc -eq 0 ]]; then
         _reviewer_state_record "$primary" primary
         echo "$result"
@@ -1452,7 +1007,7 @@ call_reviewer() {
     # 降级前先记 primary 失败，主备均失败时状态文件仍保留完整尝试链
     _reviewer_state_record "$primary" primary
 
-    if result=$(_call_backend "$fallback" "$prompt" "$task_dir"); then
+    if result=$(_call_backend "$fallback" "$prompt" "$run_cwd"); then
         _reviewer_state_record "$fallback" fallback
         echo "$result"
         return 0
@@ -1464,7 +1019,7 @@ call_reviewer() {
 }
 
 # 把本次尝试的后端和路径（primary/fallback）追加到调用方指定的状态文件，
-# 文件按行保留完整尝试链（如降级时: "glm primary" + "codex fallback"），
+# 文件按行保留完整尝试链（如降级时: "claude primary" + "opencode fallback"），
 # 末行即最终实际使用的后端。call_reviewer 通常在命令替换 subshell 里运行，
 # 变量传不回父进程——review_adhoc 用它拿到「实际后端 / 是否降级」写执行日志。
 # 未设置状态文件（task 制路径）时是 no-op；写失败静默，不影响 review。
@@ -1473,161 +1028,80 @@ _reviewer_state_record() {
     printf '%s %s\n' "$1" "$2" >> "$SPARRING_BACKEND_STATE_FILE" 2>/dev/null || true
 }
 
-# backward compatibility: keep old function name
-call_agent() {
-    call_reviewer "$@"
-}
-
 # ─── 一次性 ad-hoc 审查 ──────────────────────────────────────
-# 审查一段结论/方案/diff，不创建 task，直接走配置的 review backend（默认 glm）。
-# 填补 task 制 review-proposal/review-code 之外的「快速审一条结论」场景。
+# 两种输入形态：
+#   --range <git-range>   在只读快照里做 agent 式审查：reviewer 自己跑 git diff、按需读文件
+#   stdin / 参数纯文本     审一段结论或方案，reviewer 在空目录里裁决
+# 不再接收 diff 文本。把 diff 塞进 prompt 是上一代做法，体量门禁、分片建议、
+# 超时跑飞都是它带来的；检测到 diff 就硬报错，让调用方改用 --range。
 
-# Review input budget：diff 体量门禁 + denylist 过滤。
-# 大 diff 直塞推理模型会超时跑飞（实测 ~250 行内 2min 出裁决，~450 行以上
-# 10min 超时）。策略：先剔除 denylist 文件段（lockfile/构建产物/.env——
-# .env 同时避免把密钥送给外部 reviewer API），再对剩余行数设硬上限，
-# 超限拒绝并提示分片。被排除的文件段始终列出，绝不静默截断。
-DEFAULT_MAX_DIFF_LINES=400
-
-_default_diff_excludes() {
-    cat <<'EOF'
-.env*
-*.lock
-pnpm-lock.yaml
-package-lock.json
-go.sum
-*.min.js
-*.min.css
-*.map
-*.snap
-__snapshots__/*
-*.svg
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.webp
-*.ico
-*.woff
-*.woff2
-dist/*
-build/*
-coverage/*
-node_modules/*
-EOF
+# range 右端的 commit：a...b / a..b 取 b；没有 ".." 的单个 ref 一律用 HEAD
+# （`git diff <ref>` 比的是 ref→工作区，在快照里等于空 diff，所以它不能当右端）。
+_range_right_ref() {
+    local range="$1" right=""
+    case "$range" in
+        *...*) right="${range##*...}" ;;
+        *..*)  right="${range##*..}" ;;
+    esac
+    [[ -z "$right" ]] && right="HEAD"
+    printf '%s' "$right"
 }
 
-# config review.exclude（JSON 数组）→ 每行一个 pattern
-_config_review_excludes() {
-    _config_merged | jq -r '.review.exclude[]? // empty' 2>/dev/null || true
+# range 的总变更行数（执行日志用）。用 --numstat 而不是解析 --stat 的尾行文案：
+# 数字直接能加。二进制文件那一列是 "-"，不计入。
+_range_changed_lines() {
+    git diff --numstat "$1" 2>/dev/null | awk '
+        { if ($1 ~ /^[0-9]+$/) a += $1; if ($2 ~ /^[0-9]+$/) b += $2 }
+        END { print a + b + 0 }'
 }
 
-# _diff_path_excluded <path> <pattern...>
-# pattern 按 glob 匹配三种形态：完整路径、任意目录前缀下（*/pat）、纯文件名
-_diff_path_excluded() {
-    local path="$1"; shift
-    local base="${path##*/}" pat
-    for pat in "$@"; do
-        [[ -z "$pat" ]] && continue
-        # shellcheck disable=SC2254  # 有意让 pattern 参与 glob 匹配
-        case "$path" in
-            $pat | */$pat) return 0 ;;
-        esac
-        case "$base" in
-            $pat) return 0 ;;
-        esac
-    done
-    return 1
-}
+# 只读快照：git worktree add --detach 到临时目录，reviewer 的 cwd 指向它，审完就删。
+# 注意 worktree 跟主仓库共用对象库和 ref，而 reviewer 手里有 Bash —— 工具层面挡不住它写东西。
+# 这里的"只读"是 detached（不动任何分支）+ 审完即删，不是文件系统权限。
+_REVIEW_SNAPSHOT=""
 
-# _review_filter_diff <max_lines> [pattern...]
-# stdin: 待审内容 → stdout: 过滤后的内容
-# 无 `diff --git` 标记的纯文本（结论/方案）原样通过，不设预算。
-# denylist 过滤后仍超预算：打印体量分布和分片建议到 stderr，return 1。
-_review_filter_diff() {
-    local max_lines="$1"; shift
-
-    local src
-    src=$(mktemp "${TMPDIR:-/tmp}/sparring-review-input.XXXXXX") || return 1
-    cat > "$src"
-
-    if ! grep -q '^diff --git ' "$src"; then
-        cat "$src"; rm -f "$src"; return 0
-    fi
-
-    local -a starts=() paths=()
-    local line hdr p
-    while IFS= read -r line; do
-        starts+=("${line%%:*}")
-        hdr="${line#*:}"
-        # 取 b/ 侧路径（##* b/ 取最后一处，含空格的未引号路径也能对上；
-        # 带引号的罕见路径不解析 → 不排除，宁可计入预算不漏审）
-        p="${hdr##* b/}"
-        [[ "$hdr" == *' "b/'* ]] && p=""
-        paths+=("$p")
-    done < <(grep -n '^diff --git ' "$src")
-
-    # 用 awk NR 而不是 wc -l：末行无换行符时 wc -l 会少算一行，
-    # 导致最后一个被排除段的末行漏删
-    local total
-    total=$(awk 'END { print NR }' "$src")
-
-    local -a drop_ranges=() dropped_desc=() kept_desc=()
-    local i s e seg_lines n=${#starts[@]} kept_total=0
-    for ((i = 0; i < n; i++)); do
-        s=${starts[i]}
-        if (( i + 1 < n )); then e=$(( ${starts[i+1]} - 1 )); else e=$total; fi
-        seg_lines=$((e - s + 1))
-        if [[ -n "${paths[i]}" ]] && _diff_path_excluded "${paths[i]}" "$@"; then
-            drop_ranges+=("$s:$e")
-            dropped_desc+=("$(printf '%6d  %s' "$seg_lines" "${paths[i]}")")
-        else
-            kept_total=$((kept_total + seg_lines))
-            kept_desc+=("$(printf '%6d  %s' "$seg_lines" "${paths[i]:-<无法解析的路径>}")")
-        fi
-    done
-    # 第一个 diff 标记之前的说明文字也计入预算
-    kept_total=$(( kept_total + starts[0] - 1 ))
-
-    if (( ${#dropped_desc[@]} > 0 )); then
-        {
-            echo -e "${DIM}  denylist 已排除 ${#dropped_desc[@]} 个文件段（不送审）:${NC}"
-            printf "${DIM}%s${NC}\n" "${dropped_desc[@]}"
-        } >&2
-    fi
-
-    if (( max_lines > 0 && kept_total > max_lines )); then
-        {
-            echo -e "${RED}错误: diff 过滤后仍有 ${kept_total} 行，超出预算 ${max_lines} 行${NC}"
-            echo "大 diff 会让 reviewer 超时跑飞（实测 ~450 行以上即不可靠）。建议:"
-            echo "  按文件/目录分片:  git diff <base>...HEAD -- <path> | sparring review"
-            echo "  减少上下文行数:  git diff --unified=2 ..."
-            echo "  先看体量分布:    git diff --stat <base>...HEAD"
-            echo "  调整预算(慎用):  --max-diff-lines <N>（0 = 不限），或 config review.max_diff_lines"
-            echo "最大的文件段:"
-            printf '%s\n' "${kept_desc[@]+"${kept_desc[@]}"}" | sort -rn | head -5
-        } >&2
-        rm -f "$src"
+_review_snapshot_create() {
+    local ref="$1" parent
+    parent=$(mktemp -d "${TMPDIR:-/tmp}/sparring-snapshot.XXXXXX") || return 1
+    # worktree add 要求目标路径不存在，所以建在 mktemp 目录的子路径下
+    if ! git worktree add --detach "${parent}/tree" "$ref" >/dev/null 2>&1; then
+        echo -e "${RED}错误: 无法为 ${ref} 创建 worktree 快照${NC}" >&2
+        rm -rf "$parent" 2>/dev/null || true
         return 1
     fi
-
-    if (( ${#drop_ranges[@]} == 0 )); then
-        cat "$src"
-    else
-        # drop_ranges 按构造即升序且不重叠，单指针扫描 O(N)
-        awk -v ranges="${drop_ranges[*]}" '
-            BEGIN { n = split(ranges, r, " "); for (i = 1; i <= n; i++) { split(r[i], b, ":"); rs[i] = b[1]; re[i] = b[2] } cur = 1 }
-            {
-                while (cur <= n && NR > re[cur]) cur++
-                if (cur <= n && NR >= rs[cur] && NR <= re[cur]) next
-                print
-            }
-        ' "$src"
-    fi
-    rm -f "$src"
-    return 0
+    _REVIEW_SNAPSHOT="${parent}/tree"
 }
 
+# 幂等：没建过、已删过、目录已消失都安全。
+_review_snapshot_cleanup() {
+    [[ -n "$_REVIEW_SNAPSHOT" ]] || return 0
+    local dir="$_REVIEW_SNAPSHOT"
+    _REVIEW_SNAPSHOT=""
+    git worktree remove --force "$dir" >/dev/null 2>&1 || true
+    rm -rf "$(dirname "$dir")" 2>/dev/null || true
+    # remove 失败（比如目录已被手删）时留下的登记项由 prune 收尾
+    git worktree prune >/dev/null 2>&1 || true
+}
+
+# 内容是不是 diff 文本（首列 "diff --git " 或 "--- a/"）
+_looks_like_diff() {
+    printf '%s' "$1" | grep -qE '^(diff --git |--- a/)'
+}
+
+# range 模式给 reviewer 的指令。审查对象是仓库本身，不是一段文本，
+# 所以这里给的是"去哪看、怎么看"，不是 diff 内容。
+_range_review_prompt() {
+    local range="$1" right="$2"
+    cat <<PROMPTEOF
+本次审查对象是当前 git 仓库的一段改动，range: ${range}
+
+你的工作目录是这个仓库的只读快照（detached 在 ${right}）。请自己动手看：
+- 先跑 \`git diff ${range}\` 看全部改动；体量大就先 \`git diff --stat ${range}\` 摸分布，再按文件/目录分批看
+- 需要上下文就直接读文件、grep 调用方，不要只盯 diff 猜上下文
+- 跳过 lockfile、构建产物、生成代码、二进制资源，它们不是审查对象
+- 快照是一次性的，不要改动任何文件
+PROMPTEOF
+}
 # ─── review 执行日志 ─────────────────────────────────────────
 # 每次 ad-hoc review 在 ${XDG_STATE_HOME:-~/.local/state}/sparring/ 追加一行
 # JSONL（review-YYYYMMDD.jsonl，按天分文件），记录实际后端/是否降级/耗时/裁决，
@@ -1646,9 +1120,11 @@ _review_log_retention_days() {
     printf '%s' "$days"
 }
 
-# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via>
+# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via> [mode] [range]
+# mode: range（审 git range）| text（审一段文本）；range 字段无则 null。
 _review_log_append() {
     local exit_code="$1" verdict="$2" title="$3" input_lines="$4" duration_s="$5" backend="$6" via="$7"
+    local mode="${8:-text}" range="${9:-}"
     local days
     days=$(_review_log_retention_days)
     [[ "$days" == "0" ]] && return 0
@@ -1667,20 +1143,128 @@ _review_log_append() {
         --arg backend "${backend:-unknown}" \
         --arg via "${via:-unknown}" \
         --arg verdict "$verdict" \
+        --arg mode "$mode" \
+        --arg range "$range" \
         --argjson input_lines "$input_lines" \
         --argjson duration_s "$duration_s" \
         --argjson exit_code "$exit_code" \
-        '{ts: $ts, title: $title, input_lines: $input_lines, backend: $backend,
+        '{ts: $ts, title: $title, mode: $mode, range: (if $range == "" then null else $range end),
+          input_lines: $input_lines, backend: $backend,
           via: $via, duration_s: $duration_s, exit_code: $exit_code, verdict: $verdict}' \
         >> "${dir}/review-$(date +%Y%m%d).jsonl" 2>/dev/null || true
+}
+
+# _review_run <prompt> <run_cwd> <title> <mode> <range> <input_lines>
+# range 模式和文本模式共用的尾段：调 reviewer → 打印结果 → 落执行日志 → 按裁决定退出码。
+_review_run() {
+    local prompt="$1" run_cwd="$2" title="$3" mode="$4" range="$5" input_lines="$6"
+
+    # 执行日志采集：起始时间 + 实际后端状态文件
+    # （call_reviewer 在命令替换 subshell 里跑，靠文件把 backend/via 传回来）
+    local _log_t0 _log_state
+    _log_t0=$(date +%s)
+    _log_state=$(mktemp "${TMPDIR:-/tmp}/sparring-review-state.XXXXXX" 2>/dev/null) || _log_state=""
+    [[ -n "$_log_state" ]] && SPARRING_BACKEND_STATE_FILE="$_log_state"
+
+    local result rc=0
+    result=$(call_reviewer "$prompt" "$run_cwd") || rc=$?
+
+    local _log_backend="" _log_via="" _log_dur
+    if [[ -n "$_log_state" && -s "$_log_state" ]]; then
+        # 状态文件是尝试链（每行一次尝试），末行 = 最终实际使用的后端
+        read -r _log_backend _log_via <<< "$(tail -n 1 "$_log_state" 2>/dev/null)" || true
+    fi
+    [[ -n "$_log_state" ]] && rm -f "$_log_state" 2>/dev/null
+    unset SPARRING_BACKEND_STATE_FILE
+    _log_dur=$(( $(date +%s) - _log_t0 ))
+
+    if [[ $rc -ne 0 ]]; then
+        _review_log_append "$rc" ERROR "$title" "$input_lines" "$_log_dur" \
+            "$_log_backend" "$_log_via" "$mode" "$range"
+        return $rc
+    fi
+
+    printf '%s\n' "$result"
+
+    # 退出码反映结论。严格匹配列首大写裁决词（reviewer prompt 强制此格式），
+    # 不用 -i、不容前导空格，避免审查正文里的 approve/concerns 误命中。
+    # 解析不出明确裁决时 return 1（按错误处理，绝不默认放行 — 触发铁律兜底）。
+    local verdict
+    verdict=$(printf '%s' "$result" | grep -m1 -oE '^(APPROVE|CONCERNS)' || true)
+    case "$verdict" in
+        APPROVE)
+            _review_log_append 0 APPROVE "$title" "$input_lines" "$_log_dur" \
+                "$_log_backend" "$_log_via" "$mode" "$range"
+            return 0
+            ;;
+        CONCERNS)
+            _review_log_append 2 CONCERNS "$title" "$input_lines" "$_log_dur" \
+                "$_log_backend" "$_log_via" "$mode" "$range"
+            return 2
+            ;;
+        *)
+            echo -e "${YELLOW}⚠ 无法从 reviewer 输出解析出 APPROVE/CONCERNS 裁决，按调用错误处理（exit 1）${NC}" >&2
+            _review_log_append 1 ERROR "$title" "$input_lines" "$_log_dur" \
+                "$_log_backend" "$_log_via" "$mode" "$range"
+            return 1
+            ;;
+    esac
+}
+
+# 在只读快照里审一段 git range
+_review_range() {
+    local range="$1" title="$2"
+
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        echo -e "${RED}错误: --range 需要在 git 仓库里执行${NC}" >&2
+        return 1
+    fi
+    # range 合法性直接拿 git 验，别自己解析
+    if ! git diff --stat "$range" >/dev/null 2>&1; then
+        echo -e "${RED}错误: 无效的 git range: ${range}${NC}" >&2
+        echo "  例: sparring review --range origin/main...HEAD" >&2
+        return 1
+    fi
+
+    local right
+    right=$(_range_right_ref "$range")
+    if ! git rev-parse --verify --quiet "${right}^{commit}" >/dev/null 2>&1; then
+        echo -e "${DIM}  (range 右端 ${right} 解析不出 commit，快照回退到 HEAD)${NC}" >&2
+        right="HEAD"
+    fi
+
+    local input_lines
+    input_lines=$(_range_changed_lines "$range")
+
+    # 快照清理走 trap：审查中途被 Ctrl-C / kill(TERM) 时也要收干净，
+    # 只靠 per-return 清理的话中断路径会漏。实测 bash 3.2 下命令替换子 shell
+    # 不触发 EXIT trap，所以 call_reviewer 那层的 $(...) 不会误删快照。
+    trap '_review_snapshot_cleanup' EXIT INT TERM
+    if ! _review_snapshot_create "$right"; then
+        trap - EXIT INT TERM
+        return 1
+    fi
+    echo -e "${DIM}  只读快照: ${_REVIEW_SNAPSHOT} (detached ${right})${NC}" >&2
+
+    local prompt
+    prompt=$(_range_review_prompt "$range" "$right")
+    [[ -n "$title" ]] && prompt="【审查主题】${title}"$'\n\n'"$prompt"
+    local conventions
+    conventions=$(load_review_conventions)
+    [[ -n "$conventions" ]] && prompt="$prompt"$'\n\n## Review 约定\n'"$conventions"
+
+    local rc=0
+    _review_run "$prompt" "$_REVIEW_SNAPSHOT" "$title" range "$range" "$input_lines" || rc=$?
+
+    _review_snapshot_cleanup
+    trap - EXIT INT TERM
+    return $rc
 }
 
 review_adhoc() {
     local title=""
     local content=""
-    local max_diff_lines=""
-    local no_default_excludes=false
-    local -a extra_excludes=()
+    local range=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --title)
@@ -1691,52 +1275,41 @@ review_adhoc() {
                 title="$2"
                 shift 2
                 ;;
-            --max-diff-lines)
-                if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
-                    echo -e "${RED}错误: --max-diff-lines 需要一个非负整数（0 = 不限）${NC}" >&2
+            --range)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo -e "${RED}错误: --range 需要一个 git range，例: origin/main...HEAD${NC}" >&2
                     return 1
                 fi
-                max_diff_lines="$2"
+                range="$2"
                 shift 2
-                ;;
-            --exclude)
-                if [[ $# -lt 2 ]]; then
-                    echo -e "${RED}错误: --exclude 需要一个 glob pattern${NC}" >&2
-                    return 1
-                fi
-                extra_excludes+=("$2")
-                shift 2
-                ;;
-            --no-default-excludes)
-                no_default_excludes=true
-                shift
                 ;;
             -h|--help)
                 cat >&2 <<'USAGE'
-用法: sparring review [选项] [<内容>]
-  审查一段结论/方案/diff，不创建 task；内容由参数和/或 stdin 传入。
-  走当前配置的 review backend（review.backend，默认 glm）。
+用法: sparring review [--title <主题>] (--range <git-range> | [<内容>])
+  reviewer 是个 agent：给它 range 它自己去仓库里查，给它文本它就事论事裁决。
   退出码: 0=APPROVE  2=CONCERNS  1=调用错误
 
-diff 输入自带体量门禁（纯文本结论不受影响）：
-  先剔除 denylist 文件段（lockfile / 构建产物 / .env / 图片字体等，
-  以及 config review.exclude 数组里的 pattern），过滤后仍超预算则拒绝
-  （默认 400 行——大 diff 会让 reviewer 超时跑飞，请按文件分片送审）。
+两种输入形态:
+  --range <git-range>   审当前仓库的一段改动（推荐）。会 git worktree 建一个只读快照，
+                        reviewer 在快照里自己跑 git diff、读文件、追调用方上下文，
+                        审完自动删快照。不再有 diff 体量限制，也不需要分片。
+  <内容> / stdin        审一段结论或方案文本（不建快照）。
 
-执行日志（排查超时/降级用）：
+  ⚠ 不再接收 diff 文本（`git diff | sparring review` 会直接报错）——改用 --range。
+
+后端 (config review.backend，默认 claude；fallback 默认 opencode):
+  claude    Claude Code CLI，开 Bash + 只读工具，禁写类/联网工具
+  opencode  opencode run --agent plan
+
+执行日志（排查超时/降级用）:
   每次调用追加一行 JSONL 到 ~/.local/state/sparring/review-YYYYMMDD.jsonl
-  （字段: ts/title/input_lines/backend/via/duration_s/exit_code/verdict），
+  （字段: ts/title/mode/range/input_lines/backend/via/duration_s/exit_code/verdict），
   默认保留 7 天（config: review.log_retention_days，0 = 禁用）。
 
-选项:
-  --title <主题>          审查主题，会拼在内容前
-  --max-diff-lines <N>    diff 行数预算，0 = 不限（默认 400，config: review.max_diff_lines）
-  --exclude <glob>        追加排除 pattern，可重复（config: review.exclude 数组）
-  --no-default-excludes   不用内置 denylist（--exclude 指定的仍生效）
 示例:
+  sparring review --range origin/main...HEAD
+  sparring review --range HEAD~3..HEAD --title "登录重构"
   echo "<上下文+结论>" | sparring review
-  git diff origin/main...HEAD | sparring review --title "改动主题"
-  git diff origin/main...HEAD -- src/core | sparring review --title "core 部分"
 USAGE
                 return 0
                 ;;
@@ -1746,6 +1319,21 @@ USAGE
                 ;;
         esac
     done
+
+    # range 模式一律不读 stdin。非交互环境（CI / agent 子进程）里 stdin 常是个
+    # 永远不关闭的管道，`cat` 会一直阻塞 —— 实测 `sparring review --range X` 直接卡死。
+    # range 的输入本来就来自 git，不需要 stdin；真有人管道送了东西就提醒一句被忽略了。
+    if [[ -n "$range" ]]; then
+        if [[ "$content" == *[![:space:]]* ]]; then
+            echo -e "${RED}错误: --range 和文本内容不能同时给${NC}" >&2
+            echo "  审 range 用: sparring review --range origin/main...HEAD" >&2
+            echo "  审文本用:   echo '<内容>' | sparring review" >&2
+            return 1
+        fi
+        [[ -p /dev/stdin ]] && echo -e "${YELLOW}⚠ --range 模式不读 stdin，管道里的内容已忽略${NC}" >&2
+        _review_range "$range" "$title"
+        return $?
+    fi
 
     # 追加 stdin（管道/重定向）
     if [[ ! -t 0 ]]; then
@@ -1763,86 +1351,29 @@ USAGE
     # 注意：不要用 ${content//[[:space:]]/} 判空——bash 对大字符串做全量
     # pattern 删除是灾难级慢（22KB diff 实测卡死数十秒），glob 单遍短路即可
     if [[ "$content" != *[![:space:]]* ]]; then
-        echo -e "${RED}错误: 没有收到要审查的内容（用参数或 stdin 传入）${NC}" >&2
+        echo -e "${RED}错误: 没有收到要审查的内容（用 --range、参数或 stdin 传入）${NC}" >&2
         return 1
     fi
 
-    # diff 体量门禁 + denylist（详见 _review_filter_diff；纯文本原样通过）
-    if [[ -z "$max_diff_lines" ]]; then
-        max_diff_lines=$(_config_get review.max_diff_lines)
-        [[ "$max_diff_lines" =~ ^[0-9]+$ ]] || max_diff_lines=$DEFAULT_MAX_DIFF_LINES
-    fi
-    local -a exclude_patterns=()
-    if [[ "$no_default_excludes" != true ]]; then
-        local pat
-        while IFS= read -r pat; do
-            [[ -n "$pat" ]] && exclude_patterns+=("$pat")
-        done < <(_default_diff_excludes; _config_review_excludes)
-    fi
-    exclude_patterns+=(${extra_excludes[@]+"${extra_excludes[@]}"})
-    content=$(printf '%s' "$content" | _review_filter_diff "$max_diff_lines" \
-        ${exclude_patterns[@]+"${exclude_patterns[@]}"}) || return 1
-    if [[ "$content" != *[![:space:]]* ]]; then
-        echo -e "${RED}错误: denylist 过滤后没有剩余可审内容（全部文件段都被排除）${NC}" >&2
-        echo "  如确要审这些文件: --no-default-excludes 或调整 --exclude" >&2
+    # diff 文本硬拒：不做静默兼容，直接指到 --range
+    if _looks_like_diff "$content"; then
+        echo -e "${RED}错误: sparring review 不再接收 diff 文本${NC}" >&2
+        echo "  改用: sparring review --range origin/main...HEAD" >&2
+        echo "  reviewer 会在只读快照里自己跑 git diff，不再有体量上限，也不用分片。" >&2
         return 1
     fi
 
-    if [[ -n "$title" ]]; then
-        content="【审查主题】${title}"$'\n\n'"$content"
-    fi
+    local prompt="以下是需要你审查的内容（是一段结论/方案文本，不是代码仓库，就事论事审）：
 
+${content}"
+    [[ -n "$title" ]] && prompt="【审查主题】${title}"$'\n\n'"$prompt"
     local conventions
     conventions=$(load_review_conventions)
-    [[ -n "$conventions" ]] && content="$content"$'\n\n## Review 约定\n'"$conventions"
+    [[ -n "$conventions" ]] && prompt="$prompt"$'\n\n## Review 约定\n'"$conventions"
 
-    # 执行日志采集：送审体量、起始时间、以及实际后端状态文件
-    # （call_reviewer 在命令替换 subshell 里跑，靠文件把 backend/via 传回来）
-    local _log_lines _log_t0 _log_state
-    _log_lines=$(printf '%s' "$content" | awk 'END { print NR }')
-    _log_t0=$(date +%s)
-    _log_state=$(mktemp "${TMPDIR:-/tmp}/sparring-review-state.XXXXXX" 2>/dev/null) || _log_state=""
-    [[ -n "$_log_state" ]] && SPARRING_BACKEND_STATE_FILE="$_log_state"
-
-    local result rc=0
-    result=$(call_reviewer "$content" "") || rc=$?
-
-    local _log_backend="" _log_via="" _log_dur
-    if [[ -n "$_log_state" && -s "$_log_state" ]]; then
-        # 状态文件是尝试链（每行一次尝试），末行 = 最终实际使用的后端
-        read -r _log_backend _log_via <<< "$(tail -n 1 "$_log_state" 2>/dev/null)" || true
-    fi
-    [[ -n "$_log_state" ]] && rm -f "$_log_state" 2>/dev/null
-    unset SPARRING_BACKEND_STATE_FILE
-    _log_dur=$(( $(date +%s) - _log_t0 ))
-
-    if [[ $rc -ne 0 ]]; then
-        _review_log_append "$rc" ERROR "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
-        return $rc
-    fi
-
-    printf '%s\n' "$result"
-
-    # 退出码反映结论。严格匹配列首大写裁决词（reviewer prompt 强制此格式），
-    # 不用 -i、不容前导空格，避免审查正文里的 approve/concerns 误命中。
-    # 解析不出明确裁决时 return 1（按错误处理，绝不默认放行 — 触发铁律兜底）。
-    local verdict
-    verdict=$(printf '%s' "$result" | grep -m1 -oE '^(APPROVE|CONCERNS)' || true)
-    case "$verdict" in
-        APPROVE)
-            _review_log_append 0 APPROVE "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
-            return 0
-            ;;
-        CONCERNS)
-            _review_log_append 2 CONCERNS "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
-            return 2
-            ;;
-        *)
-            echo -e "${YELLOW}⚠ 无法从 reviewer 输出解析出 APPROVE/CONCERNS 裁决，按调用错误处理（exit 1）${NC}" >&2
-            _review_log_append 1 ERROR "$title" "$_log_lines" "$_log_dur" "$_log_backend" "$_log_via"
-            return 1
-            ;;
-    esac
+    local input_lines
+    input_lines=$(printf '%s' "$prompt" | awk 'END { print NR }')
+    _review_run "$prompt" "" "$title" text "" "$input_lines"
 }
 
 # ─── 初始化 ─────────────────────────────────────────────────
@@ -1935,9 +1466,6 @@ create_task() {
 **观察者**: ${reviewer}
 EOF
 
-    # 初始化 Cursor Agent session
-    init_agent_session "${task_dir}"
-
     echo -e "${GREEN}✓ 任务创建成功: ${task_id}${NC}"
     echo -e "${BLUE}任务目录: ${task_dir}${NC}"
     echo -e "${YELLOW}执行者: ${executor}  观察者: ${reviewer}${NC}"
@@ -2007,24 +1535,20 @@ review_proposal() {
     echo -e "${YELLOW}观察者: ${reviewer_label}${NC}"
     echo ""
 
-    local proposal_content
-    proposal_content=$(cat "${task_dir}/proposal.md")
-
     local conventions
     conventions=$(load_review_conventions)
     local conventions_section=""
     [[ -n "$conventions" ]] && conventions_section=$'\n\n## Review 约定\n'"$conventions"
 
+    # 方案正文不内联进 prompt：reviewer 的 cwd 就是项目根，让它自己读方案、
+    # 也顺手对着真实代码核方案里的前提是否成立。
     local prompt="你正在 review 一份技术方案。
 
 任务: $(jq -r '.task_name' "${task_dir}/meta.json")
+方案文件: ${task_dir}/proposal.md
 
-方案内容:
-${proposal_content}${conventions_section}
-
-请 review 并回复:
-- APPROVE: 如果方案合理可行
-- CONCERNS: <编号列表> 如果有问题
+请自己读方案文件；方案里提到的现有代码、模块、约定，直接在当前工作目录（项目根）里核实，
+不要只按方案的自述判断。${conventions_section}
 
 重点: 架构合理性、可行性、边界情况、安全性。
 只提真正有问题的点，不要提远期优化建议或假设性场景防御。请用中文简洁回复。"
@@ -2032,7 +1556,7 @@ ${proposal_content}${conventions_section}
     echo -e "${DIM}正在调用 ${reviewer_label} (${backend} backend) review...${NC}"
 
     local review_result
-    if review_result=$(call_reviewer "$prompt" "$task_dir"); then
+    if review_result=$(call_reviewer "$prompt" "$PROJECT_ROOT"); then
         echo "$review_result" > "${task_dir}/proposal-review-${review_num}.md"
         echo ""
         echo -e "${GREEN}Review 结果:${NC}"
@@ -2094,9 +1618,8 @@ implement() {
     echo ""
     echo "  方案文件: ${task_dir}/proposal.md"
     echo ""
-    echo "实现完成后:"
-    echo "  git diff > ${task_dir}/changes.diff"
-    echo "  sparring review-code ${task_id}"
+    echo "实现完成后直接跑: sparring review-code ${task_id}"
+    echo "  (reviewer 会自己在项目里跑 git diff 看未提交改动，不用先导出 diff 文件)"
 
     update_meta "$task_dir" '.steps.implementation = "in_progress"'
 }
@@ -2133,16 +1656,14 @@ review_code() {
     echo -e "${YELLOW}观察者: ${reviewer_label}${NC}"
     echo ""
 
-    local diff_content=""
-    if [[ -f "${task_dir}/changes.diff" ]]; then
-        diff_content=$(cat "${task_dir}/changes.diff")
-    else
-        diff_content=$(cd "$PROJECT_ROOT" && git diff 2>/dev/null || echo "(无法获取 diff)")
+    # 审的是工作区里还没提交的改动，所以 reviewer 直接在项目根（活树）里跑，不建快照。
+    if ! (cd "$PROJECT_ROOT" && git rev-parse --git-dir >/dev/null 2>&1); then
+        echo -e "${YELLOW}⚠ ${PROJECT_ROOT} 不是 git 仓库，无法做代码 review${NC}"
+        return 1
     fi
-
-    if [[ -z "$diff_content" || "$diff_content" == "(无法获取 diff)" ]]; then
-        echo -e "${YELLOW}⚠ 未检测到代码改动${NC}"
-        echo "请先保存 diff: git diff > ${task_dir}/changes.diff"
+    if (cd "$PROJECT_ROOT" && git diff --quiet HEAD 2>/dev/null); then
+        echo -e "${YELLOW}⚠ 未检测到未提交的代码改动${NC}"
+        echo "  已提交的改动用: sparring review --range <base>...HEAD"
         return 1
     fi
 
@@ -2151,16 +1672,16 @@ review_code() {
     local conventions_section=""
     [[ -n "$conventions" ]] && conventions_section=$'\n\n## Review 约定\n'"$conventions"
 
+    # diff 不内联进 prompt：让 reviewer 自己跑，顺带能读改动周边的代码和调用方。
     local prompt="你正在 review 代码实现。
 
 任务: $(jq -r '.task_name' "${task_dir}/meta.json")
+方案文件: ${task_dir}/proposal.md（存在的话，先读它，核对实现有没有偏离方案）
 
-代码改动:
-${diff_content}${conventions_section}
-
-请 review 并回复:
-- APPROVE: 如果代码质量良好
-- CONCERNS: <编号列表> 如果有问题
+你的工作目录就是项目根。请自己动手看：
+- \`git status\` + \`git diff HEAD\` 看本次未提交的全部改动
+- 按需读文件、grep 调用方，确认改动对周边代码的影响
+- 跳过 lockfile、构建产物、生成代码${conventions_section}
 
 重点: 正确性、安全性、边界 case、测试覆盖。
 只提真正有问题的点，不要提远期优化建议或假设性场景防御。请用中文简洁回复。"
@@ -2168,7 +1689,7 @@ ${diff_content}${conventions_section}
     echo -e "${DIM}正在调用 ${reviewer_label} (${backend} backend) review...${NC}"
 
     local review_result
-    if review_result=$(call_reviewer "$prompt" "$task_dir"); then
+    if review_result=$(call_reviewer "$prompt" "$PROJECT_ROOT"); then
         echo "$review_result" > "${task_dir}/code-review-${review_num}.md"
         echo ""
         echo -e "${GREEN}Code Review 结果:${NC}"
@@ -2575,9 +2096,6 @@ ${body}
 **Issue**: https://github.com/${repo}/issues/${issue_number}
 EOF
 
-    # 初始化 Cursor Agent session
-    init_agent_session "${task_dir}"
-
     echo ""
     echo -e "${GREEN}本地任务已创建: ${task_id}${NC}"
     echo -e "${BLUE}任务目录: ${task_dir}${NC}"
@@ -2802,19 +2320,10 @@ show_status() {
 
 # ─── Config 子命令 ──────────────────────────────────────────
 
-# 返回给用户看的配置视图：合并后 + key 字段做掩码
+# 返回给用户看的配置视图。两个后端都靠各自 CLI 的登录态，
+# sparring 自己不存任何 key，所以这里没有需要打掩码的字段。
 _config_masked_view() {
-    _config_merged | jq '
-        def mask(v):
-            if v == null or v == "" then v
-            else
-                (v | tostring) as $s
-                | if ($s | length) <= 8 then "***"
-                  else ($s[0:4]) + "***" + ($s[-4:])
-                  end
-            end;
-        (.glm.api_key |= mask(.))
-    '
+    _config_merged
 }
 
 config_show() {
@@ -2839,7 +2348,7 @@ config_get_cmd() {
     if [[ -z "$path" ]]; then
         echo -e "${RED}错误: 请提供 key 路径${NC}" >&2
         echo "用法: sparring config get <key.path>" >&2
-        echo "示例: sparring config get glm.api_key" >&2
+        echo "示例: sparring config get review.backend" >&2
         return 1
     fi
     local val
@@ -2890,14 +2399,13 @@ config_init() {
     mkdir -p "$dir" "$(dirname "$target")"
 
     if $project_mode; then
-        # 项目级：只放团队需统一的非主观项（如 timeout/retries），绝不放 backend/model/api_key。
+        # 项目级：只放团队需统一的非主观项（如 timeout/retries），绝不放 backend/model。
         # 用什么 reviewer 后端和模型由各开发者全局配置决定，项目级不约束（写了会覆盖个人选择）。
-        # 项目级配置不支持 secrets — api_key 只能放全局 config 或 SPARRING_GLM_API_KEY env。
         cat > "$target" <<'EOF'
 {
-  "_comment": "项目级 Sparring 配置（团队共享，入库）。只放团队需要统一的非主观项（如 review.timeout / retries）。用什么 reviewer 后端和模型由各开发者的全局配置 (~/.config/sparring/config.json) 决定 —— 项目级不要设 review.backend / fallback / *.model，写了会覆盖每个人的个人选择。切勿填 api_key（放全局 config 或 SPARRING_GLM_API_KEY 环境变量）。",
+  "_comment": "项目级 Sparring 配置（团队共享，入库）。只放团队需要统一的非主观项（如 review.timeout / retries）。用什么 reviewer 后端和模型由各开发者的全局配置 (~/.config/sparring/config.json) 决定 —— 项目级不要设 review.backend / fallback / *.model，写了会覆盖每个人的个人选择。",
   "review": {
-    "timeout": 120,
+    "timeout": 600,
     "retries": 1
   }
 }
@@ -2913,39 +2421,39 @@ EOF
             done
         else
             {
-                echo "# Sparring — 屏蔽可能含敏感信息的本地/衍生文件"
-                echo "# 注意: api_key 只应放在全局 ~/.config/sparring/config.json 或 SPARRING_GLM_API_KEY 环境变量"
+                echo "# Sparring — 屏蔽本地/衍生文件"
                 echo "# 项目级 config.json 默认入库用于团队共享"
                 printf '%s\n' "${want_rules[@]}"
             } > "$gi"
         fi
         echo -e "${GREEN}✓ 项目级配置已创建: ${target}${NC}"
         echo "  ${dir}/.gitignore 已就绪（屏蔽 *.local.json / *.secret.json）"
-        echo -e "${YELLOW}  ⚠ 不要在 ${target} 里设 backend / 模型 / api_key — 这些由各开发者全局配置决定${NC}"
-        echo "  全局配置（backend / 模型 / api_key）: sparring config init"
+        echo -e "${YELLOW}  ⚠ 不要在 ${target} 里设 backend / 模型 — 这些由各开发者全局配置决定${NC}"
+        echo "  全局配置（backend / 模型）: sparring config init"
     else
-        # 全局：含 key 占位符。chmod 600
+        # 全局：backend 选择 + 模型。两个后端都靠各自 CLI 的登录态，这里不存任何 key。
         cat > "$target" <<'EOF'
 {
-  "_comment": "全局 Sparring 配置。含 API key，已 chmod 600。不要入库。想要主备降级可把 fallback 设成 cursor/codex/claude 之一（claude 依赖本机已登录的 Claude Code CLI，非纯 API key 场景慎用）。",
+  "_comment": "全局 Sparring 配置。backend / fallback 只能是 claude 或 opencode，两者都用各自 CLI 已登录的账号，sparring 不存 API key。model 留 null = 用该 CLI 自己的默认模型。",
   "review": {
-    "backend": "glm",
-    "fallback": null,
-    "timeout": 120,
+    "backend": "claude",
+    "fallback": "opencode",
+    "timeout": 600,
     "retries": 1,
     "log_retention_days": 7
   },
-  "glm": {
-    "api_key": "",
-    "model": "glm-5.1",
-    "thinking": "disabled"
+  "claude": {
+    "model": null
+  },
+  "opencode": {
+    "model": null
   }
 }
 EOF
         chmod 600 "$target"
         echo -e "${GREEN}✓ 全局配置已创建: ${target}${NC} (chmod 600)"
-        echo "  编辑该文件填入 glm.api_key，或用 SPARRING_GLM_API_KEY 环境变量。"
-        echo "  获取 GLM key: https://open.bigmodel.cn/usercenter/apikeys"
+        echo "  默认 backend=claude、fallback=opencode，两个 CLI 都要先各自登录。"
+        echo "  检查连通性: sparring verify"
     fi
 }
 
@@ -2956,11 +2464,11 @@ sparring config — 配置管理
 用法: sparring config <子命令> [参数]
 
 子命令:
-  show              打印合并后的生效配置（key 打掩码）
+  show              打印合并后的生效配置
   path              打印 global / project 配置文件路径
-  get <key.path>    取单个配置值（敏感字段自动掩码）
+  get <key.path>    取单个配置值
                     例: sparring config get review.backend
-                        sparring config get glm.api_key
+                        sparring config get claude.model
   init              生成全局配置 ~/.config/sparring/config.json (chmod 600)
   init project      生成项目配置 ./.sparring/config.json (团队共享)
   init --force      已存在时强制覆盖（只作用于 config.json，不动 .gitignore）
@@ -2969,7 +2477,7 @@ sparring config — 配置管理
   sparring config init
   sparring config init project
   sparring config show
-  sparring config get glm.api_key
+  sparring config get claude.model
 HELPEOF
 }
 
@@ -2998,253 +2506,53 @@ config_cmd() {
 
 # ─── 验证环境 ────────────────────────────────────────────────
 
-_verify_cursor() {
-    local ok=true
-    echo -n "agent (Cursor CLI): "
-    if command -v agent &>/dev/null; then
-        echo -e "${GREEN}✓ $(agent --version 2>/dev/null || echo 'installed')${NC}"
-    else
+# 后端连通性自检：两个后端都是 agent CLI，跑法一样，只有命令和版本探测不同。
+# 探测故意不给任何工具活干（就让它回一个 OK），避免自检本身跑成一次真实 review。
+_verify_agent_backend() {
+    local backend="$1"
+    local label
+    label=$(reviewer_label_for_backend "$backend")
+
+    echo -n "${backend} CLI: "
+    if ! command -v "$backend" &>/dev/null; then
         echo -e "${RED}✗ 未安装${NC}"
+        case "$backend" in
+            claude)   echo -e "${DIM}  npm install -g @anthropic-ai/claude-code${NC}" ;;
+            opencode) echo -e "${DIM}  安装说明: https://opencode.ai/docs${NC}" ;;
+        esac
         return 1
     fi
+    echo -e "${GREEN}✓ $(command "$backend" --version 2>/dev/null | head -1)${NC}"
 
-    load_agent_config "cursor"
-    local verify_model
-    verify_model=$(_config_get cursor.model)
-    [[ -z "$verify_model" ]] && verify_model="$AGENT_MODEL"
-    echo -e "  配置文件: ${AGENTS_DIR}/cursor.md"
-    echo -e "  模型: ${verify_model}"
-    if [[ -n "$AGENT_SYSTEM_PROMPT" ]]; then
-        echo -e "  System prompt: $(echo "$AGENT_SYSTEM_PROMPT" | wc -l | tr -d ' ') 行"
-    else
-        echo -e "  System prompt: (无)"
-    fi
-
-    echo -n "  连通性: "
-    local result
-    if result=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd 15 agent --print --trust --model "$verify_model" "Reply with only: OK" 2>&1); then
-        if echo "$result" | grep -qi "OK"; then
-            echo -e "${GREEN}✓ 正常${NC}"
-        else
-            echo -e "${YELLOW}? 有响应但内容异常: ${result:0:50}${NC}"
-        fi
-    else
-        echo -e "${RED}✗ 连接失败${NC}"
-        echo -e "${DIM}  提示: 检查网络和代理配置${NC}"
-        return 1
-    fi
-    $ok
-}
-
-_verify_codex() {
-    echo -n "codex CLI: "
-    if command -v codex &>/dev/null; then
-        echo -e "${GREEN}✓ $(codex --version 2>/dev/null | head -1)${NC}"
-    else
-        echo -e "${RED}✗ 未安装${NC}"
-        return 1
-    fi
-
-    local codex_model codex_effort codex_home
-    codex_model=$(_config_get codex.model)
-    codex_effort=$(_config_get codex.effort)
-    codex_home=$(_config_get codex.home)
-    [[ -z "$codex_home" ]] && codex_home="${TMPDIR:-/tmp}/workflow-codex-home-${USER:-user}"
-    mkdir -p "$codex_home"
-    echo -e "  模型: ${codex_model:-default(config.toml)}"
-    echo -e "  推理: ${codex_effort:-default(config.toml)}"
-    echo -e "  CODEX_HOME: ${codex_home}"
-
-    echo -n "  连通性: "
-    local output_file command_output_file
-    output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-verify-codex-out.XXXXXX")
-    command_output_file=$(mktemp "${TMPDIR:-/tmp}/workflow-verify-codex-log.XXXXXX")
-
-    local codex_cmd=(codex exec --sandbox read-only --ephemeral --skip-git-repo-check --color never --output-last-message "$output_file")
-    [[ -n "$codex_model" ]] && codex_cmd+=(--model "$codex_model")
-    [[ -n "$codex_effort" ]] && codex_cmd+=(-c "model_reasoning_effort=\"$codex_effort\"")
-    codex_cmd+=("Reply with only: OK")
-
-    local codex_ok=true
-    if HTTP_PROXY= HTTPS_PROXY= CODEX_HOME="$codex_home" _timeout_cmd 20 "${codex_cmd[@]}" < /dev/null > "$command_output_file" 2>&1; then
-        local codex_result
-        if [[ -s "$output_file" ]]; then
-            codex_result=$(cat "$output_file")
-        else
-            codex_result=$(cat "$command_output_file" 2>/dev/null || true)
-        fi
-        codex_result=$(echo "$codex_result" | sed '/^WARNING: proceeding, even though we could not update PATH:/d')
-
-        if echo "$codex_result" | grep -qi "OK"; then
-            echo -e "${GREEN}✓ 正常${NC}"
-        else
-            echo -e "${YELLOW}? 有响应但内容异常: ${codex_result:0:80}${NC}"
-        fi
-    else
-        codex_ok=false
-    fi
-
-    if [[ "$codex_ok" != "true" ]]; then
-        local codex_err hint=""
-        codex_err=$(cat "$command_output_file" 2>/dev/null || true)
-
-        # 模式识别：常见失败类型给更友好的提示
-        if echo "$codex_err" | grep -qi 'unauthor\|not logged in\|login'; then
-            hint="运行 codex login 登录"
-        elif echo "$codex_err" | grep -qi 'no such file\|command not found'; then
-            hint="先安装 codex CLI: npm install -g @openai/codex"
-        elif echo "$codex_err" | grep -qi 'timeout'; then
-            hint="调大 SPARRING_REVIEW_TIMEOUT 或检查网络"
-        elif echo "$codex_err" | grep -qi 'failed to load skill'; then
-            hint="CODEX_HOME 状态损坏，清理 $codex_home 后重试"
-        else
-            hint="运行 codex login 登录，或检查 WORKFLOW_CODEX_MODEL / 网络"
-        fi
-
-        # 取第一行非空 stderr，去掉时间戳前缀，长度截断
-        local err_summary
-        err_summary=$(echo "$codex_err" | grep -vE '^$|^[[:space:]]*$' | head -1 | \
-                      sed -E 's/^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+ //' | cut -c1-100)
-
-        echo -e "${RED}✗ 连接失败${NC}"
-        [[ -n "$err_summary" ]] && echo -e "${DIM}  错误: ${err_summary}${NC}"
-        echo -e "${YELLOW}  提示: ${hint}${NC}"
-        rm -f "$output_file" "$command_output_file"
-        return 1
-    fi
-
-    rm -f "$output_file" "$command_output_file"
-    return 0
-}
-
-_verify_glm() {
-    echo -n "curl: "
-    if command -v curl &>/dev/null; then
-        echo -e "${GREEN}✓ $(curl --version | head -1 | awk '{print $2}')${NC}"
-    else
-        echo -e "${RED}✗ 未安装${NC}"
-        return 1
-    fi
-
-    local api_key api_base model thinking
-    api_key=$(_config_get glm.api_key)
-    api_base=$(_config_get glm.api_base)
-    model=$(_config_get glm.model)
-    thinking=$(_config_get glm.thinking)
-
-    echo -n "glm.api_key: "
-    if [[ -z "$api_key" ]]; then
-        echo -e "${RED}✗ 未配置${NC}"
-        echo -e "${DIM}  sparring config init  或  export SPARRING_GLM_API_KEY=<id.secret>${NC}"
-        return 1
-    fi
-    local key_masked="${api_key:0:4}***${api_key: -4}"
-    echo -e "${GREEN}✓ ${key_masked}${NC}"
-    echo -e "  API base: ${api_base}"
-    echo -e "  模型: ${model}"
-    echo -e "  thinking: ${thinking}"
-
-    echo -n "  连通性: "
-    local response_file http_status payload
-    response_file=$(mktemp "${TMPDIR:-/tmp}/workflow-verify-glm.XXXXXX")
-    payload=$(jq -n --arg m "$model" --arg t "$thinking" \
-        '{model:$m,messages:[{role:"user",content:"Reply with only: OK"}],thinking:{type:$t},max_tokens:64,temperature:0.1}')
-
-    http_status=$(HTTP_PROXY= HTTPS_PROXY= _timeout_cmd 30 \
-        curl -sS -w '%{http_code}' -o "$response_file" \
-            --connect-timeout 10 --max-time 25 \
-            -X POST "${api_base}/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${api_key}" \
-            -d "$payload" 2>/dev/null) || http_status="000"
-
-    if [[ "$http_status" == "200" ]]; then
-        local glm_result
-        glm_result=$(jq -r '.choices[0].message.content // ""' "$response_file" 2>/dev/null)
-        if echo "$glm_result" | grep -qi "OK"; then
-            echo -e "${GREEN}✓ 正常${NC}"
-        else
-            echo -e "${YELLOW}? 有响应但内容异常: ${glm_result:0:80}${NC}"
-        fi
-        rm -f "$response_file"
-        return 0
-    fi
-
-    local body
-    body=$(cat "$response_file" 2>/dev/null | head -c 200)
-    rm -f "$response_file"
-    echo -e "${RED}✗ 连接失败 (HTTP ${http_status})${NC}"
-    [[ -n "$body" ]] && echo -e "${DIM}  响应: ${body}${NC}"
-    return 1
-}
-
-_verify_claude() {
-    echo -n "claude CLI: "
-    if command -v claude &>/dev/null; then
-        echo -e "${GREEN}✓ $(command claude --version 2>/dev/null | head -1)${NC}"
-    else
-        echo -e "${RED}✗ 未安装${NC}"
-        echo -e "${DIM}  npm install -g @anthropic-ai/claude-code${NC}"
-        return 1
-    fi
-
-    local model base_url api_key config_dir use_proxy
-    model=$(_config_get claude.model)
-    base_url=$(_config_get claude.base_url)
-    api_key=$(_config_get claude.api_key)
-    config_dir=$(_config_get claude.config_dir)
-    use_proxy=$(_config_get claude.use_proxy)
-
-    local route="原生 Claude（本机登录态）"
-    if [[ -n "$base_url" ]]; then
-        route="第三方端点 ${base_url}"
-        echo -n "claude.api_key: "
-        if [[ -z "$api_key" ]]; then
-            echo -e "${RED}✗ 未配置（配了 base_url 必须配 api_key）${NC}"
-            echo -e "${DIM}  sparring config init  或  export SPARRING_CLAUDE_API_KEY=<token>${NC}"
-            return 1
-        fi
-        echo -e "${GREEN}✓ ${api_key:0:4}***${api_key: -4}${NC}"
-    fi
-    echo -e "  路由: ${route}"
-    echo -e "  模型: ${model:-default(已登录账号)}"
+    local model use_proxy
+    model=$(_config_get "${backend}.model")
+    use_proxy=$(_config_get "${backend}.use_proxy")
+    echo -e "  模型: ${model:-default(CLI 自己的默认)}"
     echo -e "  代理: $([[ "$use_proxy" == "true" ]] && echo "保留" || echo "已清空")"
 
-    # 原生路径：全局 CLAUDE.md 会被加载 → 提示用 config_dir 隔离
-    if [[ -z "$base_url" && -z "$config_dir" && -f "$HOME/.claude/CLAUDE.md" ]]; then
-        echo -e "${YELLOW}  ⚠ 检测到 ~/.claude/CLAUDE.md，原生路径下会被注入 reviewer 上下文${NC}"
-        echo -e "${DIM}    递归已被禁工具阻断；如需彻底隔离，设 claude.config_dir 指向一个已登录但无 CLAUDE.md 的目录${NC}"
+    # 原生 claude 会加载 ~/.claude/CLAUDE.md 进 reviewer 上下文
+    if [[ "$backend" == "claude" && -f "$HOME/.claude/CLAUDE.md" ]]; then
+        echo -e "${DIM}  注: ~/.claude/CLAUDE.md 会被加载进 reviewer 上下文${NC}"
     fi
 
     echo -n "  连通性: "
-    local out err_file ephemeral_cfg="" run_cwd vcfg
-    err_file=$(mktemp "${TMPDIR:-/tmp}/workflow-verify-claude-log.XXXXXX")
+    AGENT_CMD=()
+    case "$backend" in
+        claude)   _agent_cmd_claude "$model" ;;
+        opencode) _agent_cmd_opencode "$model" ;;
+    esac
+
+    local out err_file run_cwd
+    err_file=$(mktemp "${TMPDIR:-/tmp}/sparring-verify-log.XXXXXX")
     run_cwd=$(mktemp -d "${TMPDIR:-/tmp}/sparring-verify-cwd.XXXXXX")
-    if [[ -n "$config_dir" ]]; then
-        vcfg="$config_dir"
-    elif [[ -n "$base_url" ]]; then
-        vcfg=$(mktemp -d "${TMPDIR:-/tmp}/sparring-verify-cfg.XXXXXX")
-        ephemeral_cfg="$vcfg"
-    else
-        vcfg="$HOME/.claude"
-    fi
-
-    local -a envs=("CLAUDE_CONFIG_DIR=$vcfg")
-    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
-    if [[ -n "$base_url" ]]; then
-        envs+=("ANTHROPIC_BASE_URL=$base_url" "ANTHROPIC_AUTH_TOKEN=$api_key" "ANTHROPIC_API_KEY=")
-        [[ -n "$model" ]] && envs+=("ANTHROPIC_MODEL=$model")
-    fi
-    local -a vcmd=(claude -p --output-format text)
-    [[ -n "$model" ]] && vcmd+=(--model "$model")
-    vcmd+=(--disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task")
-
-    # 清理：显式 rm（理由同 call_claude_agent，不用 trap）
     local _vclean="rm -f \"$err_file\"; rm -rf \"$run_cwd\""
-    [[ -n "$ephemeral_cfg" ]] && _vclean="$_vclean; rm -rf \"$ephemeral_cfg\""
 
-    if out=$( cd "$run_cwd" && _timeout_cmd 60 env "${envs[@]}" "${vcmd[@]}" \
+    local -a envs=()
+    [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+
+    if out=$( cd "$run_cwd" && _timeout_cmd 90 env ${envs[@]+"${envs[@]}"} "${AGENT_CMD[@]}" \
                 <<< "Reply with only: OK" 2>"$err_file" ); then
+        out=$(printf '%s' "$out" | _strip_agent_noise)
         if echo "$out" | grep -qi "OK"; then
             echo -e "${GREEN}✓ 正常${NC}"
         else
@@ -3256,19 +2564,20 @@ _verify_claude() {
 
     local err_summary hint
     err_summary=$(grep -vE '^$' "$err_file" 2>/dev/null | head -1 | cut -c1-120)
-    if echo "$err_summary" | grep -qi 'unauthor\|401\|invalid.*key\|authentication'; then
-        hint="检查 claude.api_key / 端点鉴权方式（第三方端点用 token）"
+    if echo "$err_summary" | grep -qi 'unauthor\|401\|invalid.*key\|authentication\|not logged in'; then
+        hint="先登录该 CLI（claude: claude login；opencode: opencode auth login）"
     elif echo "$err_summary" | grep -qi 'not found\|command not found\|enoent'; then
-        hint="npm install -g @anthropic-ai/claude-code"
+        hint="CLI 没装好，按上面的安装说明重装"
     elif echo "$err_summary" | grep -qi 'timeout\|timed out'; then
-        hint="调大 SPARRING_REVIEW_TIMEOUT 或检查网络/代理（国产端点别走代理）"
+        hint="调大 SPARRING_REVIEW_TIMEOUT 或检查网络/代理"
     else
-        hint="原生路径确认已 claude login；第三方路径确认 base_url/api_key/model 正确"
+        hint="确认该 CLI 能在终端里直接跑通，再确认 ${backend}.model 配置正确"
     fi
     eval "$_vclean"
     echo -e "${RED}✗ 连接失败${NC}"
     [[ -n "$err_summary" ]] && echo -e "${DIM}  错误: ${err_summary}${NC}"
     echo -e "${YELLOW}  提示: ${hint}${NC}"
+    echo -e "${DIM}  (标签: ${label})${NC}"
     return 1
 }
 
@@ -3279,12 +2588,7 @@ _verify_backend() {
     label=$(reviewer_label_for_backend "$backend")
     echo ""
     echo -e "${BLUE}── ${role}: ${label} (${backend}) ──${NC}"
-    case "$backend" in
-        cursor) _verify_cursor; return $? ;;
-        codex)  _verify_codex; return $? ;;
-        glm)    _verify_glm; return $? ;;
-        claude) _verify_claude; return $? ;;
-    esac
+    _verify_agent_backend "$backend"
 }
 
 verify() {
@@ -3304,12 +2608,19 @@ verify() {
         ok=false
     fi
 
+    echo -n "git: "
+    if command -v git &>/dev/null; then
+        echo -e "${GREEN}✓ $(git --version | awk '{print $3}')${NC}"
+    else
+        echo -e "${RED}✗ 未安装（--range 快照审查依赖 git worktree）${NC}"
+        ok=false
+    fi
+
     echo -n "超时: "
-    local _verify_base _verify_attempts _verify_worst
+    local _verify_base _verify_attempts
     _verify_base=$(_agent_timeout)
     _verify_attempts=$(_agent_attempts)
-    _verify_worst=$(( (_verify_base + ADAPTIVE_TIMEOUT_MAX_EXTRA) * _verify_attempts ))
-    echo -e "${GREEN}${_verify_base}s${NC} 起（按内容大小自适应加时，单次最多 +${ADAPTIVE_TIMEOUT_MAX_EXTRA}s）  重试次数: $(_config_get review.retries) (共 ${_verify_attempts} 次尝试，最坏总等待 ≈ ${_verify_worst}s)"
+    echo -e "${GREEN}${_verify_base}s${NC}/次  重试次数: $(_config_get review.retries) (共 ${_verify_attempts} 次尝试，最坏总等待 ≈ $(( _verify_base * _verify_attempts ))s)"
 
     _verify_backend "主 backend" "$primary" || ok=false
 
@@ -3322,7 +2633,7 @@ verify() {
         fi
     else
         echo ""
-        echo -e "${DIM}备 backend: 未配置（设置 WORKFLOW_REVIEW_BACKEND_FALLBACK 启用降级）${NC}"
+        echo -e "${DIM}备 backend: 未配置（设置 review.fallback / SPARRING_REVIEW_FALLBACK 启用降级）${NC}"
     fi
 
     echo ""
@@ -3356,7 +2667,7 @@ _validate_backend_env() {
         val="${!var:-}"
         [[ -z "$val" ]] && continue
         if ! _normalize_backend "$val" >/dev/null 2>&1; then
-            echo -e "${RED}错误: ${var}='${val}' 不是合法 backend（仅支持 cursor / codex / glm / claude）${NC}" >&2
+            echo -e "${RED}错误: ${var}='${val}' 不是合法 backend（仅支持 ${REVIEW_BACKENDS}）${NC}" >&2
             exit 1
         fi
     done
@@ -3430,9 +2741,12 @@ ${YELLOW}初始化:${NC}
   ${GREEN}verify${NC}                        验证环境 (依赖、review backend 连通性)
 
 ${YELLOW}快速审查 (不建 task):${NC}
-  ${GREEN}review${NC} [--title <主题>] [<内容>]  审一段结论/方案/diff，内容由参数或 stdin 传入
-                                走配置的 backend(默认 glm)；退出码 0=APPROVE 2=CONCERNS 1=错误
-                                例: git diff origin/main...HEAD | sparring review --title "改动"
+  ${GREEN}review --range${NC} <git-range>   审当前仓库的一段改动（推荐）。建只读 worktree 快照，
+                                reviewer 在快照里自己跑 git diff / 读文件，审完删快照。
+                                例: sparring review --range origin/main...HEAD
+  ${GREEN}review${NC} [--title <主题>] [<内容>]  审一段结论/方案文本（参数或 stdin 传入，不建快照）
+                                退出码 0=APPROVE 2=CONCERNS 1=错误
+                                ⚠ 不再接收 diff 文本，管道进 diff 会直接报错 — 改用 --range
 
 ${YELLOW}任务管理:${NC}
   ${GREEN}init${NC}                          初始化工作流目录
@@ -3471,9 +2785,9 @@ ${YELLOW}GitHub Issue 集成:${NC}
 ${YELLOW}配置:${NC}
   ${GREEN}config init${NC}                 生成 ~/.config/sparring/config.json
   ${GREEN}config init project${NC}         生成 .sparring/config.json（项目级，团队共享）
-  ${GREEN}config show${NC}                 显示合并后的生效配置（key 打掩码）
+  ${GREEN}config show${NC}                 显示合并后的生效配置
   ${GREEN}config path${NC}                 打印 global / project 配置文件路径
-  ${GREEN}config get <key.path>${NC}       取单个值，如 config get glm.api_key
+  ${GREEN}config get <key.path>${NC}       取单个值，如 config get review.backend
 
 ${YELLOW}全局选项:${NC}
   ${GREEN}--project${NC} <url>               指定 GitHub Project 看板 URL
@@ -3488,23 +2802,18 @@ ${YELLOW}环境变量（可覆盖 config.json 任意字段）:${NC}
   兼容 WORKFLOW_* 前缀（历史变量）
 
   ${DIM}示例:${NC}
-    SPARRING_REVIEW_BACKEND=glm     对应 review.backend
-    SPARRING_GLM_API_KEY=xxx.yyy    对应 glm.api_key
-    SPARRING_REVIEW_FALLBACK=glm    对应 review.fallback
-    SPARRING_REVIEW_TIMEOUT=180     对应 review.timeout（示例：临时手动调更大；默认起始值已是 120，一般不需要手动设，见下）
-    SPARRING_CLAUDE_BASE_URL=...    对应 claude.base_url（Claude Code 跑第三方模型时设）
-    SPARRING_CLAUDE_API_KEY=...     对应 claude.api_key（第三方端点 token）
-    SPARRING_CLAUDE_MODEL=glm-5.2   对应 claude.model
+    SPARRING_REVIEW_BACKEND=opencode  对应 review.backend（合法值: ${REVIEW_BACKENDS}）
+    SPARRING_REVIEW_FALLBACK=claude   对应 review.fallback
+    SPARRING_REVIEW_TIMEOUT=900       对应 review.timeout（单次调用秒数）
+    SPARRING_CLAUDE_MODEL=...         对应 claude.model（留空 = CLI 自己的默认模型）
+    SPARRING_OPENCODE_MODEL=...       对应 opencode.model
 
   ${DIM}历史兼容（仍生效）:${NC}
     WORKFLOW_REVIEW_BACKEND_FALLBACK → review.fallback
-    WORKFLOW_AGENT_MODEL             → cursor.model
     以及所有 WORKFLOW_* 形式的新 schema 变量
 
-  ${DIM}超时自适应: 单次调用超时 = review.timeout + min(内容字节数/${ADAPTIVE_TIMEOUT_STEP_BYTES}*${ADAPTIVE_TIMEOUT_STEP_SECONDS}s, ${ADAPTIVE_TIMEOUT_MAX_EXTRA}s)。${NC}
-  ${DIM}大 diff / 大改动送审会自动加时，无需手动调大 review.timeout。${NC}
-  ${DIM}⚠ 重试会用满同一个自适应后的单次超时（不缩水）: 最坏总等待 ≈ 单次超时 × (retries+1)，${NC}
-  ${DIM}  大 diff 默认配置下最坏可达 1200s(20min)。想快速失败可设 review.retries=0。${NC}
+  ${DIM}超时: reviewer 是自己跑 git/读文件的 agent，耗时以分钟计，默认单次 600s。${NC}
+  ${DIM}⚠ 最坏总等待 ≈ review.timeout × (retries+1)。想快速失败可设 review.retries=0。${NC}
 
 ${YELLOW}Issue 相关环境变量:${NC}
   WORKFLOW_POLL_INTERVAL  issue 轮询间隔秒数 (默认: ${ISSUE_POLL_INTERVAL})
@@ -3515,6 +2824,7 @@ ${YELLOW}Issue 相关环境变量:${NC}
 ${YELLOW}示例:${NC}
   sparring setup                             # 交互式初始化
   sparring verify                           # 检查环境
+  sparring review --range origin/main...HEAD # 审当前分支的改动
   sparring create "refactor-auth" claude     # 创建任务
   sparring review-proposal <task-id>        # 自动 review
   sparring --project https://github.com/orgs/kanyun-inc/projects/3 issue-poll

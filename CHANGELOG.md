@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.0.0 (2026-08-12)
+
+**Breaking。** review 从「调用方把 diff 文本管道进来、单发给模型」改成「reviewer 是个 agent，自己进仓库查」。旧的 `git diff ... | sparring review` 用法会直接报错，旧配置里的 backend 值也会被拒绝，需要按下面改。
+
+### 行为变更
+
+- **新增 `sparring review --range <git-range>`**，如 `sparring review --range origin/main...HEAD`。执行时 `git worktree add --detach` 建一个只读快照，reviewer 的工作目录指向快照，自己跑 `git diff <range>`、按需读文件和追调用方；审完删快照（正常、失败、被 kill 都清）。
+- **不再接收 diff 文本**：stdin 里出现 `diff --git ` / `--- a/` 打头的行直接报错并提示改用 `--range`，不做静默兼容。纯文本审查（审结论/方案）保留原样。
+- `--range` 模式不读 stdin。非交互环境里 stdin 常是不会关闭的管道，读它会永久阻塞。
+- **后端从 4 个收敛到 2 个**：`claude`（`claude -p`，放行 Bash + Read/Grep/Glob，禁 Edit/Write/NotebookEdit/Task/WebFetch/WebSearch）和 `opencode`（`opencode run --agent plan`）。cursor / codex / glm 三个后端连同 `agents/cursor.md` 一起删除。
+- **默认值**：`review.backend` glm → `claude`；`review.fallback` null → `opencode`；`review.timeout` 120 → `600`。
+- **删除输入体量门禁**：`--max-diff-lines`、`--exclude`、`--no-default-excludes`、内置 denylist、400 行上限、分片建议全部移除。reviewer 自己进仓库看，prompt 里不再有 diff，也就没有体量问题。
+- **删除自适应超时**：不再按送审内容大小加时，改回扁平的 `review.timeout`。
+- **配置里不再有任何 API key**：两个后端都用各自 CLI 已登录的账号。`glm.*`、`claude.base_url` / `api_key` / `config_dir` / `mode` 全部删除。现在的 schema 只剩 `review.{backend,fallback,timeout,retries,log_retention_days}` + `claude.{model,use_proxy,extra_args}` + `opencode.{model,use_proxy,extra_args}`。
+- **task 制 review 同步 agent 化**：`review-proposal` / `review-code` 不再把方案正文和 diff 内联进 prompt，reviewer 的工作目录 = 项目根（活树，不建快照），自己读方案文件、自己跑 `git diff`。`review-code` 之前不用再 `git diff > changes.diff`。
+
+### 新增
+
+- 执行日志 JSONL 增加 `mode`（`range` / `text`）和 `range` 字段；range 模式下 `input_lines` 记该 range 的总变更行数。
+
+### 迁移
+
+旧配置里 `review.backend` 是 `glm` / `cursor` / `codex` 的会直接报错退出（不静默降级）。改成 `claude` 或 `opencode`，或重跑 `sparring config init --force`。调用方脚本里的 `git diff ... | sparring review` 改成 `sparring review --range ...`。
+
+### 已知边界
+
+reviewer 在快照里有 Bash 权限，工具层面挡不住它写文件——快照的"只读"靠的是 detached（不动任何分支）+ 审完即删，不是文件系统权限。快照与主仓库共用 `.git` 对象库。
+
 ## 2.3.0 (2026-07-22)
 
 ### 新增

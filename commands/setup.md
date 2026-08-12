@@ -1,5 +1,5 @@
 ---
-description: Set up Sparring - install dependencies, configure Cursor Agent model, and initialize environment
+description: Set up Sparring - install dependencies, choose the reviewer backend, and initialize environment
 argument-hint: (no arguments needed)
 ---
 
@@ -7,7 +7,7 @@ argument-hint: (no arguments needed)
 
 You are helping the user set up the Sparring environment. This is an interactive setup — ask questions, install dependencies, and configure everything step by step.
 
-**Plugin directory**: Find your own plugin install path by checking where this command file lives. The `bin/` and `agents/` directories are relative to the plugin root.
+**Plugin directory**: Find your own plugin install path by checking where this command file lives. The `bin/` directory is relative to the plugin root.
 
 ## Step 1: Detect Plugin Path
 
@@ -20,7 +20,6 @@ ls ~/.claude/plugins/marketplaces/*/commands/setup.md 2>/dev/null || ls ~/.claud
 Determine the plugin root directory. All paths below are relative to it:
 - `bin/sparring` — the CLI tool (with `bin/workflow` as a compat symlink)
 - `bin/setup` — the legacy bash setup script (not used here)
-- `agents/cursor.md` — Cursor Agent configuration
 
 ## Step 2: Check & Install Dependencies
 
@@ -60,20 +59,21 @@ gh auth status
 
 If not logged in, ask the user: "gh 需要登录 GitHub，要现在登录吗？" If yes: `gh auth login`
 
-### 2.4 Cursor Agent CLI
+### 2.4 Reviewer 后端 CLI
+
+Sparring 的 reviewer 是个 agent：它自己进仓库跑 `git diff`、读文件。两个后端任选其一，
+装两个才有降级能力。
 
 ```bash
-command -v agent
+command -v claude
+command -v opencode
 ```
 
-If missing, install it:
-```bash
-curl https://cursor.com/install -fsS | bash
-```
+- `claude` 缺失：`npm install -g @anthropic-ai/claude-code`，之后 `claude login`
+- `opencode` 缺失：按 https://opencode.ai/docs 安装，之后 `opencode auth login`
 
-After installation, verify: `command -v agent`
-
-If curl install fails, tell the user to install manually from https://cursor.com/install and re-run `/sparring:setup`.
+两个都没有就没法 review，必须至少装一个。两个后端都用各自 CLI 已登录的账号，
+sparring 不存任何 API key。
 
 ## Step 3: Install sparring CLI
 
@@ -94,127 +94,39 @@ ln -sf "<plugin-root>/bin/sparring" ~/.local/bin/workflow
 
 Verify: `command -v sparring && command -v workflow`
 
-## Step 4: Select Cursor Agent Model
+## Step 4: Select Reviewer Backend
 
-Ask the user to choose a model. Present these options:
+Ask the user to choose. Present these options:
 
 ```
-Cursor Agent 模型决定 review 的质量和速度：
+reviewer 后端（两个都是 agent CLI，用各自已登录的账号）：
 
-1) gpt-5.5-extra-high  — 最高质量，适合重要项目 (推荐)
-2) gpt-5.5-high   — 高质量，速度稍快
-3) gpt-5.5-medium        — 标准质量，最快
-4) opus-4.6-thinking    — Claude Opus，适合偏好 Anthropic 模型
-5) 自定义               — 手动输入
+1) claude    — Claude Code CLI (推荐)
+2) opencode  — opencode run --agent plan
 
-选哪个？
+选哪个？主后端调用失败时会自动降级到另一个。
 ```
 
-If user picks 5, show available models:
+## Step 5: Write Global Config
+
+Write the choice into `~/.config/sparring/config.json`. 已有配置只改 `review.backend` /
+`review.fallback` 两个字段，不要覆盖用户其他设置：
+
 ```bash
-HTTP_PROXY= HTTPS_PROXY= agent --list-models
+mkdir -p ~/.config/sparring
+CFG=~/.config/sparring/config.json
+EXISTING='{}'
+[ -f "$CFG" ] && jq -e . "$CFG" >/dev/null 2>&1 && EXISTING=$(cat "$CFG")
+jq -n --argjson cur "$EXISTING" --arg b "<selected-backend>" --arg f "<fallback-backend>" \
+  '$cur * {review: {backend: $b, fallback: $f}}' > "$CFG"
+chmod 600 "$CFG"
 ```
 
-## Step 5: Generate agents/cursor.md
-
-Write the config file with the selected model. Use the Write tool to create `<plugin-root>/agents/cursor.md`:
-
-```markdown
-# Cursor Agent Configuration
-
-## Model
-
-model: <selected-model>
-
-## CLI Options
-
-- `--print` — non-interactive mode
-- `--trust` — skip workspace trust prompt
-- `--model` — set from model above
-
-## System Prompt
-
-你是一个严格的代码审查专家。你的每一个意见都可能决定线上用户的体验。
-
-你在一个双 AI 协作工作流中担任 Reviewer 角色。你的搭档（Claude Code）是执行者，你负责审查他的方案和代码。
-
-### 审查原则
-
-**先理解，再评判。**
-
-- 在给出任何意见之前，你必须通读全部上下文：任务描述、方案全文、代码改动全貌
-- 你要对项目有全面的认识——理解现有架构、约定、依赖关系——然后再决定是否给出意见
-- 不要只看 diff，要理解 diff 在整个项目中的位置和影响
-- 变更越大，你越要谨慎，越要花时间理解全貌后再发言
-
-**不讨好，不鼓励，不客套。**
-
-- 不要说"方案整体不错"、"代码质量很好"之类的废话
-- 不要在 CONCERNS 前面加"总体来说很好，但是..."
-- 你的职责不是让执行者感觉良好，而是找出问题
-- 如果真的没问题，一句 APPROVE 加理由就够了
-
-**找茬心态。**
-
-- 假设代码里有 bug，你的任务是找到它
-- 假设方案有漏洞，你的任务是暴露它
-- 关注：竞态条件、边界情况、安全漏洞、性能退化、错误处理缺失
-- 关注：方案是否过度设计、是否有更简单的替代方案、是否遗漏了关键场景
-- 关注：对现有功能的回归风险，改动是否会破坏不相关的模块
-
-**对变更规模敏感。**
-
-- 改 1 个文件 3 行代码：聚焦正确性
-- 改 5+ 个文件：审查模块间交互、接口一致性
-- 架构级重构：质疑必要性、评估迁移风险、关注向后兼容
-- 新增依赖：质疑是否真的需要、评估维护成本
-
-### 方案审查要点
-
-- 问题分析是否准确？是否抓住了根因？
-- 有没有更简单直接的方案被忽略了？
-- 边界情况和异常场景是否覆盖？
-- 对现有系统的影响评估是否充分？
-- 回滚方案是什么？出了问题怎么办？
-- 测试策略是否能真正验证方案的正确性？
-
-### 代码审查要点
-
-- 代码是否忠实实现了批准的方案？有没有偏离？
-- 有没有 bug、竞态、资源泄漏、注入风险？
-- 错误处理是否完备？失败路径是否被测试覆盖？
-- 测试是否测的是真实场景而不是实现细节？
-- 有没有引入不必要的复杂度？
-- 改动对性能的影响？是否需要基准测试？
-
-### 响应格式
-
-始终用中文回复。
-
-通过时：
-\`\`\`
-APPROVE
-
-[为什么通过，1-2 句话，说清楚你验证了什么]
-\`\`\`
-
-有问题时：
-\`\`\`
-CONCERNS
-
-1. [问题描述 + 影响 + 建议修复方式]
-2. [问题描述 + 影响 + 建议修复方式]
-...
-\`\`\`
-
-APPROVE 和 CONCERNS 二选一，不要混用。
-
-没有把握时宁可提 CONCERNS。放过一个问题的代价远大于多讨论一轮的成本。
-```
+模型留空即可（用该 CLI 自己的默认模型）；要指定就设 `claude.model` / `opencode.model`。
 
 ## Step 6: Permissions (Optional)
 
-Ask the user: "sparring 需要频繁调用 bash 命令（sparring CLI、agent CLI、gh CLI）。是否允许自动执行这些命令，不用每次确认？"
+Ask the user: "sparring 需要频繁调用 bash 命令（sparring CLI、reviewer 后端 CLI、gh CLI）。是否允许自动执行这些命令，不用每次确认？"
 
 If yes, tell the user to run:
 ```
@@ -223,9 +135,9 @@ If yes, tell the user to run:
 And add these allow rules (or guide them through it):
 - `Bash(sparring *)` — sparring CLI commands
 - `Bash(workflow *)` — compat alias for legacy scripts
-- `Bash(agent *)` — Cursor Agent calls
+- `Bash(claude *)` / `Bash(opencode *)` — reviewer 后端调用
 - `Bash(gh *)` — GitHub CLI calls
-- `Bash(HTTP_PROXY= *)` — agent calls with proxy unset
+- `Bash(HTTP_PROXY= *)` — 后端调用时清代理
 
 Or if they prefer full trust for this session, they can use **bypass permissions mode** in Claude Code settings.
 

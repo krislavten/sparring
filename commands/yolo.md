@@ -27,7 +27,7 @@ User: yes → Commit!
 
 ## Cross-Review Principle
 
-Same as normal mode: **every conclusion, recommendation, and decision must be reviewed by Cursor Agent before presenting to the user.** In YOLO mode this includes:
+Same as normal mode: **every conclusion, recommendation, and decision must be reviewed before presenting to the user.** In YOLO mode this includes:
 - The proposal itself (via `sparring review-proposal`)
 - Any key technical decisions made during implementation
 - The final code (via `sparring review-code`)
@@ -63,7 +63,7 @@ Not good for: architectural changes, security-critical features, ambiguous requi
 
 When a task has `issue_number` in `meta.json`, sync key steps to the Issue:
 
-- **Cursor Agent reviews** are auto-synced by the `workflow` CLI with `🤖` marker
+- **Reviewer output** is auto-synced by the `workflow` CLI with the reviewer icon
 - **You (Claude/Executor)** must manually sync your actions:
   ```bash
   sparring issue-comment <number> "🧠 **[Claude Code — <Phase>]**

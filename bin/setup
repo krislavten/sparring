@@ -13,12 +13,11 @@ Sparring setup — 交互式安装
 用法: sparring setup
 
 功能:
-  1. 检查 & 安装依赖（jq、gh、cursor agent CLI 等）
-  2. 选择 Cursor Agent 模型
-  3. 生成 agents/cursor.md
-  4. 安装 CLI 软链（sparring + workflow 兼容别名）
-  5. 安装 Claude Code skill
-  6. 运行 sparring verify
+  1. 检查 & 安装依赖（jq、git、gh、reviewer 后端 CLI）
+  2. 选择 reviewer 后端（claude / opencode）并写全局配置
+  3. 可选：配置 Issue 驱动模式
+  4. 安装 CLI 软链（sparring + workflow 兼容别名）+ Claude Code skill
+  5. 运行 sparring verify
 
 必须在交互式终端里跑（stdin 是 TTY）。
 USAGE
@@ -42,7 +41,6 @@ NC='\033[0m'
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-AGENTS_DIR="${PROJECT_DIR}/agents"
 
 # ─── 工具函数 ────────────────────────────────────────────────
 
@@ -140,6 +138,14 @@ check_dependencies() {
         need_brew=true
     fi
 
+    echo -n "  git: "
+    if command -v git &>/dev/null; then
+        echo -e "${GREEN}$(git --version | awk '{print $3}')${NC}"
+    else
+        echo -e "${YELLOW}未安装${NC}"
+        need_brew=true
+    fi
+
     echo -n "  gh (GitHub CLI): "
     if command -v gh &>/dev/null; then
         echo -e "${GREEN}$(gh --version | head -1)${NC}"
@@ -148,13 +154,19 @@ check_dependencies() {
         need_brew=true
     fi
 
-    echo -n "  agent (Cursor CLI): "
-    if command -v agent &>/dev/null; then
-        local agent_ver
-        agent_ver=$(agent --version 2>/dev/null || echo "installed")
-        echo -e "${GREEN}${agent_ver}${NC}"
+    # reviewer 后端：两个都是 agent CLI，装哪个都能跑，装两个才有降级
+    echo -n "  claude (Claude Code CLI): "
+    if command -v claude &>/dev/null; then
+        echo -e "${GREEN}$(command claude --version 2>/dev/null | head -1)${NC}"
     else
-        echo -e "${YELLOW}未安装${NC}"
+        echo -e "${YELLOW}未安装 — npm install -g @anthropic-ai/claude-code${NC}"
+    fi
+
+    echo -n "  opencode: "
+    if command -v opencode &>/dev/null; then
+        echo -e "${GREEN}$(command opencode --version 2>/dev/null | head -1)${NC}"
+    else
+        echo -e "${YELLOW}未安装 — 见 https://opencode.ai/docs${NC}"
     fi
 
     # 安装缺失的 brew 依赖
@@ -164,6 +176,10 @@ check_dependencies() {
 
         if ! command -v jq &>/dev/null; then
             brew_install jq
+        fi
+
+        if ! command -v git &>/dev/null; then
+            brew_install git
         fi
 
         if ! command -v gh &>/dev/null; then
@@ -177,32 +193,20 @@ check_dependencies() {
         fi
     fi
 
-    # agent CLI — 直接安装，不需要确认
-    if ! command -v agent &>/dev/null; then
-        echo ""
-        echo -e "  ${YELLOW}正在安装 Cursor Agent CLI...${NC}"
-        if curl https://cursor.com/install -fsS | bash; then
-            # installer 可能装到新路径，刷新
-            export PATH="$HOME/.local/bin:$HOME/.cursor/bin:$PATH"
-            if command -v agent &>/dev/null; then
-                echo -e "  ${GREEN}agent CLI 安装成功${NC}"
-            else
-                echo -e "${RED}安装完成但 agent 命令未找到，请检查 PATH${NC}"
-            fi
-        else
-            echo -e "${RED}agent CLI 安装失败${NC}"
-            echo -e "  手动安装: ${DIM}curl https://cursor.com/install -fsS | bash${NC}"
-            exit 1
-        fi
-    fi
-
-    # 最终检查必要依赖
+    # 最终检查必要依赖：jq/git 必须有，reviewer 后端至少有一个
     echo ""
     local ok=true
     echo -n "  最终检查 — jq: "
     if command -v jq &>/dev/null; then echo -e "${GREEN}OK${NC}"; else echo -e "${RED}缺失${NC}"; ok=false; fi
-    echo -n "  最终检查 — agent: "
-    if command -v agent &>/dev/null; then echo -e "${GREEN}OK${NC}"; else echo -e "${RED}缺失${NC}"; ok=false; fi
+    echo -n "  最终检查 — git: "
+    if command -v git &>/dev/null; then echo -e "${GREEN}OK${NC}"; else echo -e "${RED}缺失${NC}"; ok=false; fi
+    echo -n "  最终检查 — reviewer 后端: "
+    if command -v claude &>/dev/null || command -v opencode &>/dev/null; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}缺失（claude / opencode 至少装一个）${NC}"
+        ok=false
+    fi
 
     if [[ "$ok" == false ]]; then
         echo ""
@@ -211,41 +215,33 @@ check_dependencies() {
     fi
 }
 
-# ─── Step 2: 选择模型 ────────────────────────────────────────
+# ─── Step 2: 选择 reviewer 后端 ──────────────────────────────
 
-select_model() {
-    print_step 2 5 "选择 Cursor Agent 模型"
+select_backend() {
+    print_step 2 5 "选择 reviewer 后端"
 
-    echo -e "  模型决定 Cursor Agent review 的质量和速度。"
-    echo -e "  推荐按项目重要性选择：${NC}"
+    echo -e "  reviewer 是个 agent：给它一段 range，它自己去仓库里跑 git diff、读文件。"
+    echo -e "  两个后端都用各自 CLI 已登录的账号，sparring 不存 API key。"
     echo ""
-    echo -e "    1) ${BOLD}gpt-5.5-extra-high${NC}   — 最高质量，适合重要项目 ${GREEN}(推荐)${NC}"
-    echo -e "    2) gpt-5.5-high           — 高质量，速度稍快"
-    echo -e "    3) gpt-5.5-medium         — 标准质量，最快"
-    echo -e "    4) opus-4.6-thinking      — Claude Opus，适合偏好 Anthropic 模型"
-    echo -e "    5) 自定义                 — 手动输入模型名"
+    echo -e "    1) ${BOLD}claude${NC}     — Claude Code CLI ${GREEN}(推荐)${NC}"
+    echo -e "    2) opencode   — opencode run --agent plan"
     echo ""
 
     local choice
-    choice=$(prompt_choice "选择" "1")
-
+    choice=$(prompt_choice "选择主后端" "1")
     case "$choice" in
-        1) SELECTED_MODEL="gpt-5.5-extra-high" ;;
-        2) SELECTED_MODEL="gpt-5.5-high" ;;
-        3) SELECTED_MODEL="gpt-5.5-medium" ;;
-        4) SELECTED_MODEL="opus-4.6-thinking" ;;
-        5)
-            echo ""
-            echo -e "  ${DIM}可用模型列表:${NC}"
-            HTTP_PROXY= HTTPS_PROXY= agent --list-models 2>&1 | grep -E "^\S" | head -20
-            echo ""
-            SELECTED_MODEL=$(prompt_choice "输入模型名" "gpt-5.5-extra-high")
-            ;;
-        *) SELECTED_MODEL="gpt-5.5-extra-high" ;;
+        2) SELECTED_BACKEND="opencode"; SELECTED_FALLBACK="claude" ;;
+        *) SELECTED_BACKEND="claude";   SELECTED_FALLBACK="opencode" ;;
     esac
 
     echo ""
-    echo -e "  ${GREEN}已选择: ${SELECTED_MODEL}${NC}"
+    echo -e "  主后端调用失败时会自动降级到另一个。"
+    if ! prompt_yn "  启用降级到 ${SELECTED_FALLBACK}？" "y"; then
+        SELECTED_FALLBACK=""
+    fi
+
+    echo ""
+    echo -e "  ${GREEN}主后端: ${SELECTED_BACKEND}${NC}  降级: ${SELECTED_FALLBACK:-（关闭）}"
 }
 
 # ─── Step 3: Issue 驱动配置 ──────────────────────────────────
@@ -318,101 +314,20 @@ install_and_configure() {
     ln -sf "${PROJECT_DIR}/.skills/workflow" "${skills_dir}/sparring"
     echo -e "  ${GREEN}已安装 sparring skill${NC}"
 
-    # 3. 生成 agents/cursor.md
-    mkdir -p "${AGENTS_DIR}"
-    cat > "${AGENTS_DIR}/cursor.md" <<AGENTEOF
-# Cursor Agent Configuration
-
-## Model
-
-model: ${SELECTED_MODEL}
-
-## CLI Options
-
-- \`--print\` — non-interactive mode
-- \`--trust\` — skip workspace trust prompt
-- \`--model\` — set from model above
-
-## System Prompt
-
-你是一个严格的代码审查专家。你的每一个意见都可能决定线上用户的体验。
-
-你在一个双 AI 协作工作流中担任 Reviewer 角色。你的搭档（Claude Code）是执行者，你负责审查他的方案和代码。
-
-### 审查原则
-
-**先理解，再评判。**
-
-- 在给出任何意见之前，你必须通读全部上下文：任务描述、方案全文、代码改动全貌
-- 你要对项目有全面的认识——理解现有架构、约定、依赖关系——然后再决定是否给出意见
-- 不要只看 diff，要理解 diff 在整个项目中的位置和影响
-- 变更越大，你越要谨慎，越要花时间理解全貌后再发言
-
-**不讨好，不鼓励，不客套。**
-
-- 不要说"方案整体不错"、"代码质量很好"之类的废话
-- 不要在 CONCERNS 前面加"总体来说很好，但是..."
-- 你的职责不是让执行者感觉良好，而是找出问题
-- 如果真的没问题，一句 APPROVE 加理由就够了
-
-**找茬心态。**
-
-- 假设代码里有 bug，你的任务是找到它
-- 假设方案有漏洞，你的任务是暴露它
-- 关注：竞态条件、边界情况、安全漏洞、性能退化、错误处理缺失
-- 关注：方案是否过度设计、是否有更简单的替代方案、是否遗漏了关键场景
-- 关注：对现有功能的回归风险，改动是否会破坏不相关的模块
-
-**对变更规模敏感。**
-
-- 改 1 个文件 3 行代码：聚焦正确性
-- 改 5+ 个文件：审查模块间交互、接口一致性
-- 架构级重构：质疑必要性、评估迁移风险、关注向后兼容
-- 新增依赖：质疑是否真的需要、评估维护成本
-
-### 方案审查要点
-
-- 问题分析是否准确？是否抓住了根因？
-- 有没有更简单直接的方案被忽略了？
-- 边界情况和异常场景是否覆盖？
-- 对现有系统的影响评估是否充分？
-- 回滚方案是什么？出了问题怎么办？
-- 测试策略是否能真正验证方案的正确性？
-
-### 代码审查要点
-
-- 代码是否忠实实现了批准的方案？有没有偏离？
-- 有没有 bug、竞态、资源泄漏、注入风险？
-- 错误处理是否完备？失败路径是否被测试覆盖？
-- 测试是否测的是真实场景而不是实现细节？
-- 有没有引入不必要的复杂度？
-- 改动对性能的影响？是否需要基准测试？
-
-### 响应格式
-
-始终用中文回复。
-
-通过时：
-\`\`\`
-APPROVE
-
-[为什么通过，1-2 句话，说清楚你验证了什么]
-\`\`\`
-
-有问题时：
-\`\`\`
-CONCERNS
-
-1. [问题描述 + 影响 + 建议修复方式]
-2. [问题描述 + 影响 + 建议修复方式]
-...
-\`\`\`
-
-APPROVE 和 CONCERNS 二选一，不要混用。
-
-没有把握时宁可提 CONCERNS。放过一个问题的代价远大于多讨论一轮的成本。
-AGENTEOF
-    echo -e "  ${GREEN}已生成 agents/cursor.md (模型: ${SELECTED_MODEL})${NC}"
+    # 3. 写全局配置（后端选择）。已有配置只改 backend/fallback，不动用户其他字段。
+    local cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/sparring"
+    local cfg_file="${cfg_dir}/config.json"
+    mkdir -p "$cfg_dir"
+    local existing='{}'
+    [[ -f "$cfg_file" ]] && jq -e '.' "$cfg_file" >/dev/null 2>&1 && existing=$(cat "$cfg_file")
+    jq -n --argjson cur "$existing" \
+        --arg backend "$SELECTED_BACKEND" \
+        --arg fallback "$SELECTED_FALLBACK" \
+        '$cur * {review: {backend: $backend,
+                          fallback: (if $fallback == "" then null else $fallback end)}}' \
+        > "$cfg_file"
+    chmod 600 "$cfg_file"
+    echo -e "  ${GREEN}已写入全局配置 ${cfg_file}${NC} (backend: ${SELECTED_BACKEND})"
 
     # 4. 生成环境变量提示
     if [[ "${ISSUE_CONFIGURED:-false}" == true ]]; then
@@ -431,7 +346,7 @@ run_verify() {
     print_step 5 5 "验证安装"
 
     # verify 失败不阻塞 setup 完成提示（verify return 1 是给 CI/脚本用的）
-    # 首次安装时用户可能还没配 API key 或登录 backend，这很正常
+    # 首次安装时用户可能还没登录对应的后端 CLI，这很正常
     set +e
     HTTP_PROXY= HTTPS_PROXY= bash "${PROJECT_DIR}/bin/sparring" verify 2>&1
     local rc=$?
@@ -439,7 +354,7 @@ run_verify() {
     if [[ $rc -ne 0 ]]; then
         echo ""
         echo -e "${YELLOW}⚠ verify 报告有问题，但 setup 已经完成。${NC}"
-        echo -e "${DIM}  按上面提示配置 backend / api_key 后重跑 sparring verify 即可。${NC}"
+        echo -e "${DIM}  按上面提示登录对应 CLI 后重跑 sparring verify 即可。${NC}"
     fi
 }
 
@@ -448,7 +363,7 @@ run_verify() {
 main() {
     print_header
     check_dependencies
-    select_model
+    select_backend
     configure_issue_mode
     install_and_configure
     run_verify

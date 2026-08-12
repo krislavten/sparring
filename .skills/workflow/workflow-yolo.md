@@ -172,7 +172,7 @@ Cursor: [commits] Done! 🎉
 
 When a task has `issue_number` in `meta.json`, sync key steps to the Issue:
 
-- **Cursor Agent reviews** are auto-synced by the `sparring` CLI with `🤖` marker
+- **Reviewer output** is auto-synced by the `sparring` CLI with the reviewer icon marker
 - **You (Claude/Executor)** must manually sync your actions:
   ```bash
   sparring issue-comment <number> "🧠 **[Claude Code — <Phase>]**
