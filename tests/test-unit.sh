@@ -423,7 +423,7 @@ test_backend_config_defaults() {
     source_workflow_funcs
     assert_eq "claude.model 默认 null→空" "" "$(_config_get claude.model)"
     assert_eq "opencode.model 默认 null→空" "" "$(_config_get opencode.model)"
-    assert_eq "review.timeout 默认 600" "600" "$(_config_get review.timeout)"
+    assert_eq "review.timeout 默认 1800" "1800" "$(_config_get review.timeout)"
     # 注意: jq 的 `//` 把布尔 false 和 null 都当 "empty"，故默认 false 读出来是空串。
     # 代码只比较 `== "true"`（空串视为 not-true → 清代理），行为正确，这里断言"非 true"语义。
     assert_eq "claude.use_proxy 默认非 true" "" "$(_config_get claude.use_proxy)"
@@ -787,7 +787,7 @@ test_config_defaults() {
     backend=$(_config_get review.backend)
     timeout=$(_config_get review.timeout)
     assert_eq "默认 backend=claude" "claude" "$backend"
-    assert_eq "默认 timeout=600" "600" "$timeout"
+    assert_eq "默认 timeout=1800" "1800" "$timeout"
 }
 test_config_defaults
 

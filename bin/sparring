@@ -244,7 +244,7 @@ _config_defaults() {
     "backend": "claude",
     "fallback": "opencode",
     "level": "medium",
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1,
     "log_retention_days": 7
   },
@@ -1040,23 +1040,24 @@ _resolve_secret() {
     fi
 }
 
-# 成功时设置 _OPENCODE_GW_CONFIG（配置文件路径）并把要用的 model 打到 stdout；
-# 未配置网关时输出原样 model、_OPENCODE_GW_CONFIG 保持空。
+# 结果经两个全局变量回传：_OPENCODE_GW_MODEL（要用的 model）+ _OPENCODE_GW_CONFIG
+# （临时配置路径，未配置网关时为空）。必须直呼、不能包在 $(...) 里——
+# 命令替换的子 shell 会吞掉全局赋值（此前正是这个 bug 让网关配置从未生效）。
+_OPENCODE_GW_MODEL=""
 _opencode_gateway_setup() {
     _OPENCODE_GW_CONFIG=""
     local base_url api_key model
     base_url=$(_config_get opencode.base_url)
     api_key=$(_resolve_secret "$(_config_get opencode.api_key)")
     model=$(_config_get opencode.model)
+    _OPENCODE_GW_MODEL="$model"
 
     if [[ -z "$base_url" || -z "$api_key" || -z "$model" ]]; then
-        printf '%s' "$model"
         return 0
     fi
 
     local f
     if ! f=$(mktemp "${TMPDIR:-/tmp}/sparring-opencode-cfg.XXXXXX" 2>/dev/null); then
-        printf '%s' "$model"
         return 0
     fi
     # 密钥落盘期间只对自己可读
@@ -1070,11 +1071,10 @@ _opencode_gateway_setup() {
               options: {baseURL: $url, apiKey: $key}, models: {($m): {name: $m}}}}}' \
             > "$f" 2>/dev/null; then
         rm -f "$f" 2>/dev/null || true
-        printf '%s' "$model"
         return 0
     fi
     _OPENCODE_GW_CONFIG="$f"
-    printf '%s/%s' "$_OPENCODE_GW_PROVIDER" "$model"
+    _OPENCODE_GW_MODEL="${_OPENCODE_GW_PROVIDER}/${model}"
 }
 
 # 剥掉 agent CLI 的终端噪音：ANSI 序列 + "> plan · model" 这类进度头行。
@@ -1140,7 +1140,8 @@ _call_backend() {
     # opencode 的 model 可能被网关注入改写成 <provider>/<model>
     local gw_config=""
     if [[ "$backend" == "opencode" ]]; then
-        model=$(_opencode_gateway_setup)
+        _opencode_gateway_setup
+        model="$_OPENCODE_GW_MODEL"
         gw_config="$_OPENCODE_GW_CONFIG"
     else
         model=$(_config_get "${backend}.model")
@@ -1215,10 +1216,11 @@ _call_backend() {
             break
         fi
         last_rc=$rc
+        # 超时不重试：超时几乎总是"审查体量/深度 > 时限"的确定性问题，
+        # 重试只会原样再烧一遍时限，直接交给降级链或报错
+        [[ $rc -eq 124 ]] && break
         if [[ $i -lt $max_attempts ]]; then
-            local why="退出码 ${rc}"
-            [[ $rc -eq 124 ]] && why="超时 ${timeout_s}s"
-            echo -e "${DIM}  ${backend} 调用失败（${why}），重试 ($i/$max_attempts)...${NC}" >&2
+            echo -e "${DIM}  ${backend} 调用失败（退出码 ${rc}），重试 ($i/$max_attempts)...${NC}" >&2
             sleep 2
         fi
     done
@@ -1230,7 +1232,7 @@ _call_backend() {
         eval "$_cleanup"
         if [[ $last_rc -eq 124 ]]; then
             _error_reason_record timeout
-            echo -e "${RED}错误: ${backend} 超时 ${timeout_s}s，已杀掉整个进程组 (共 ${max_attempts} 次尝试)${NC}" >&2
+            echo -e "${RED}错误: ${backend} 超时 ${timeout_s}s，已杀掉整个进程组（超时不重试）${NC}" >&2
         else
             _error_reason_record crash
             echo -e "${RED}错误: ${backend} 调用失败，退出码 ${last_rc} (共 ${max_attempts} 次尝试)${NC}" >&2
@@ -2752,7 +2754,7 @@ config_init() {
 {
   "_comment": "项目级 Sparring 配置（团队共享，入库）。只放团队需要统一的非主观项（如 review.timeout / retries）。用什么 reviewer 后端和模型由各开发者的全局配置 (~/.config/sparring/config.json) 决定 —— 项目级不要设 review.backend / fallback / *.model，写了会覆盖每个人的个人选择。",
   "review": {
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1
   }
 }
@@ -2785,7 +2787,7 @@ EOF
   "review": {
     "backend": "claude",
     "fallback": "opencode",
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1,
     "log_retention_days": 7
   },
