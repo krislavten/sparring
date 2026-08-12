@@ -59,6 +59,33 @@ _normalize_backend() {
     esac
 }
 
+# 审查强度。直接对齐 claude /code-review 的四档：低档少而准，高档广而杂。
+# opencode 没有原生等价物，由注入的对抗 prompt 翻译成"挖多深"（见 _level_directive）。
+REVIEW_LEVELS="low / medium / high / xhigh"
+REVIEW_LEVEL_DEFAULT="medium"
+
+_normalize_level() {
+    local level="$1"
+    level=$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')
+    case "$level" in
+        low|medium|high|xhigh) echo "$level"; return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+get_review_level() {
+    local raw
+    raw=$(_config_get review.level)
+    [[ -z "$raw" ]] && raw="$REVIEW_LEVEL_DEFAULT"
+    local level
+    if ! level=$(_normalize_level "$raw"); then
+        echo -e "${RED}错误: review.level 仅支持 ${REVIEW_LEVELS}${NC}" >&2
+        echo "  收到: '${raw}'" >&2
+        return 1
+    fi
+    echo "$level"
+}
+
 get_review_backend() {
     local raw
     raw=$(_config_get review.backend)
@@ -216,6 +243,7 @@ _config_defaults() {
   "review": {
     "backend": "claude",
     "fallback": "opencode",
+    "level": "medium",
     "timeout": 600,
     "retries": 1,
     "log_retention_days": 7
@@ -227,6 +255,8 @@ _config_defaults() {
   },
   "opencode": {
     "model": null,
+    "base_url": null,
+    "api_key": null,
     "use_proxy": false,
     "extra_args": null
   }
@@ -520,6 +550,7 @@ start_background_review() {
             completed_at: null,
             pid: null,
             exit_code: null,
+            error_reason: null,
             review_state: null,
             review_file: null,
             result_file: $result_file,
@@ -631,6 +662,32 @@ run_review_worker() {
     return 0
 }
 
+# 背景 worker 被 kill / OOM / 机器重启后，job JSON 会永远停在 running——
+# 状态查询是唯一会再看它的地方，就在这里就地改判，不让"静默挂死"以 running 的样子留着。
+# 判定要三个条件同时成立：状态还在跑 + 记了 pid + 这个 pid 已经没了。
+# （正常完成时 pid 被置 null、值搬去 final_pid，只看 kill -0 会把完成的误判成 failed。）
+_review_job_reap() {
+    local job_file="$1"
+    local status pid
+    status=$(jq -r '.status // empty' "$job_file" 2>/dev/null) || return 0
+    [[ "$status" == "queued" || "$status" == "running" ]] || return 0
+    pid=$(jq -r '.pid // empty' "$job_file" 2>/dev/null) || return 0
+    [[ -n "$pid" ]] || return 0
+    kill -0 "$pid" 2>/dev/null && return 0
+
+    local ts
+    ts="$(date -Iseconds)"
+    review_job_update "$job_file" \
+        --arg ts "$ts" \
+        '.status = "failed"
+         | .completed_at = $ts
+         | .final_pid = .pid
+         | .pid = null
+         | .exit_code = (.exit_code // 1)
+         | .error_reason = "crash"' >/dev/null 2>&1 || return 0
+    echo -e "${YELLOW}⚠ job $(jq -r '.job_id' "$job_file") 的 worker (pid ${pid}) 已不在，改判 failed${NC}" >&2
+}
+
 show_review_status() {
     ensure_review_jobs_dir
     local ref="${1:-}"
@@ -638,6 +695,7 @@ show_review_status() {
     if [[ -n "$ref" && -f "$(review_job_file_path "$ref")" ]]; then
         local job_file
         job_file=$(review_job_file_path "$ref")
+        _review_job_reap "$job_file"
         echo -e "${BLUE}=== Review Job: ${ref} ===${NC}"
         jq '.' "$job_file"
         local log_file
@@ -660,6 +718,7 @@ show_review_status() {
     printf "%-24s %-10s %-9s %-8s %-28s\n" "JOB_ID" "STATUS" "TYPE" "BACKEND" "TASK_ID"
     for job_file in "${files[@]}"; do
         local job_id status review_type backend task_id
+        _review_job_reap "$job_file"
         job_id=$(jq -r '.job_id' "$job_file")
         status=$(jq -r '.status' "$job_file")
         review_type=$(jq -r '.review_type' "$job_file")
@@ -788,31 +847,40 @@ ${body}"
 _timeout_cmd() {
     local duration="$1"
     shift
-    # -k 5: TERM 后 5s 仍活着补 SIGKILL（跑飞的 curl 可能不理 TERM，
+    # 超时要杀掉整棵进程树，不是只杀直接子进程：两个后端都会派生孙进程
+    # （opencode 起本地 server，claude 跑 Bash 工具），只 kill 直接子进程会留下
+    # 孤儿继续跑满额度。GNU timeout 默认就把子进程放进新进程组、超时对整组发信号
+    # （coreutils 9.11 实测孙进程一并清掉），所以它这条路天然是对的；
+    # perl 兜底路径得自己 setpgrp 建组 + 对负 pid 发信号。
+    # -k 10: TERM 后 10s 仍活着补 SIGKILL（跑飞的 curl 可能不理 TERM，
     # 实测出现过超时设置形同虚设、请求挂满 20min 的情况）
     if command -v timeout &>/dev/null; then
-        timeout -k 5 "$duration" "$@"
+        timeout -k 10 "$duration" "$@"
     elif command -v gtimeout &>/dev/null; then
-        gtimeout -k 5 "$duration" "$@"
+        gtimeout -k 10 "$duration" "$@"
     else
-        # macOS fallback: perl。与 GNU timeout 对齐：超时先 TERM，
-        # 2s 内没退干净补 KILL；超时退出码 124；子进程死于信号时
+        # macOS fallback: perl（本机没装 coreutils 时走这条）。与 GNU timeout 对齐：
+        # 超时先 TERM 整组，10s 内没退干净补 KILL；超时退出码 124；子进程死于信号时
         # 返回 128+sig（旧实现 $? >> 8 会把 SIGKILL 死亡误报成 exit 0）
         perl -e '
             use POSIX ":sys_wait_h";
             my $timeout = shift @ARGV;
             my $pid = fork();
-            if ($pid == 0) { exec @ARGV; exit 127; }
+            # 子进程自立门户当进程组组长（pgid == pid），这样 kill -$pid 覆盖它的孙进程。
+            # macOS 不自带 setsid(1)，所以只能在这里做。
+            if ($pid == 0) { setpgrp(0, 0); exec @ARGV; exit 127; }
             my $timed_out = 0;
             local $SIG{ALRM} = sub {
                 $timed_out = 1;
-                kill "TERM", $pid;
+                kill "TERM", -$pid;
                 my $waited = 0;
-                while ($waited < 2 && waitpid($pid, WNOHANG) == 0) {
+                while ($waited < 10 && waitpid($pid, WNOHANG) == 0) {
                     select(undef, undef, undef, 0.1);
                     $waited += 0.1;
                 }
-                kill "KILL", $pid if waitpid($pid, WNOHANG) == 0;
+                # 无条件对整组补 KILL：子进程可能已退出、但它派生的孙进程还活着，
+                # 按 waitpid 结果决定就会把这种孤儿漏掉
+                kill "KILL", -$pid;
             };
             alarm $timeout;
             waitpid($pid, 0);
@@ -822,6 +890,43 @@ _timeout_cmd() {
             exit(($st & 127) ? 128 + ($st & 127) : ($st >> 8));
         ' "$duration" "$@"
     fi
+}
+
+# ─── 心跳 ────────────────────────────────────────────────────
+# reviewer 一跑就是几分钟且全程没有输出，肉眼分不清"在想"和"挂了"。
+# 每 15s 往 stderr 打一行活体信号——stderr 不进 $(...) 捕获，不会污染裁决文本。
+_HEARTBEAT_PID=""
+
+_heartbeat_start() {
+    local label="$1"
+    _heartbeat_stop
+    (
+        local elapsed=0
+        while :; do
+            sleep 15
+            elapsed=$(( elapsed + 15 ))
+            printf '%s\n' "${DIM}[sparring] ${label} 审查中… 已 ${elapsed}s${NC}" >&2
+        done
+    ) &
+    _HEARTBEAT_PID=$!
+}
+
+# 幂等。wait 收尸避免 bash 打印 "Terminated" 作业消息。
+_heartbeat_stop() {
+    [[ -n "$_HEARTBEAT_PID" ]] || return 0
+    local pid="$_HEARTBEAT_PID"
+    _HEARTBEAT_PID=""
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+# ─── 失败原因 ────────────────────────────────────────────────
+# 任何一次 review 只允许三种结局：APPROVE / CONCERNS / 带原因的显式 ERROR。
+# reason ∈ timeout | crash | empty | parse。_call_backend 跑在 $(...) 子 shell 里，
+# 变量传不回父进程，所以跟 backend 状态一样用文件回传（未设置文件时是 no-op）。
+_error_reason_record() {
+    [[ -n "${SPARRING_ERROR_REASON_FILE:-}" ]] || return 0
+    printf '%s\n' "$1" > "$SPARRING_ERROR_REASON_FILE" 2>/dev/null || true
 }
 
 # ─── Reviewer 角色 prompt ────────────────────────────────────
@@ -854,17 +959,50 @@ CONCERNS
 ROLEEOF
 }
 
+# ─── 审查上下文 ─────────────────────────────────────────────
+# 两条腿在 range 模式下差别很大（claude 用原生 /code-review，opencode 用注入的方法论），
+# 命令组装得知道自己在审什么。bash 3.2 没法传结构体，用全局；调用方（_review_range /
+# review_adhoc）负责设置，_review_run 负责透传给日志。
+_RV_MODE="text"
+_RV_RANGE=""
+_RV_RIGHT=""
+_RV_LEVEL="$REVIEW_LEVEL_DEFAULT"
+
+# level 翻译成 opencode 能懂的"挖多深"。claude 腿不用这个——它直接吃 level 字面量。
+_level_directive() {
+    case "$1" in
+        low)   echo "只报你有把握的高置信度问题；宁可少报，不要为凑数写猜测。" ;;
+        medium) echo "覆盖四个角度，报确有依据的问题；不确定的可以报，但要写明不确定在哪。" ;;
+        high)  echo "尽量广地覆盖，允许报把握不足的问题，但每条都要标注置信度。" ;;
+        xhigh) echo "穷尽式排查：四个角度逐一走完，边界与异常路径全部推演一遍，宁可多报。" ;;
+    esac
+}
+
 # ─── 后端命令组装 ───────────────────────────────────────────
-# 每个后端只管"命令长什么样"；超时、重试、输出清洗、裁决解析都在 _call_backend 里共用。
-# 结果写进全局数组 AGENT_CMD（bash 3.2 没法从函数返回数组）。
+# 每个后端只管"命令长什么样、喂什么输入"；超时、心跳、重试、输出清洗、裁决解析
+# 都在 _call_backend 里共用。结果写进全局 AGENT_CMD（数组，bash 3.2 没法从函数返回）
+# 和 AGENT_STDIN（喂给 CLI 的 stdin 文本，空串表示不喂）。
+AGENT_STDIN=""
 
 _agent_cmd_claude() {
     local model="$1"
-    AGENT_CMD=(claude -p --output-format text)
+    AGENT_CMD=(claude -p)
+    if [[ "$_RV_MODE" == "range" ]]; then
+        # 走 Claude Code 原生 /code-review：审查方法论在引擎里，我们只负责给
+        # level + range + 附加指令。level 之后的文本会被当成附加审查指令传下去。
+        local slash="/code-review ${_RV_LEVEL} ${_RV_RANGE}"
+        [[ -n "$2" ]] && slash="${slash} ${2}"
+        AGENT_CMD+=("$slash")
+        AGENT_STDIN=""
+    else
+        # 纯文本审查（结论/方案）不适用 /code-review——它审的是代码改动。
+        AGENT_STDIN="$2"
+    fi
+    AGENT_CMD+=(--output-format text)
     [[ -n "$model" ]] && AGENT_CMD+=(--model "$model")
     # Bash 必须显式预批：-p 是非交互的，没预批的工具会被直接拒（不是挂起等人点同意），
-    # reviewer 跑不了 git diff 就只能盲审。实测本机 ~/.claude 已放行 Bash 时不加也能跑，
-    # 但不能指望每台机器的用户配置都这样。
+    # reviewer 跑不了 git diff 就只能盲审。实测这套只读白名单足够跑通 /code-review，
+    # 不需要 --dangerously-skip-permissions。
     AGENT_CMD+=(--allowedTools "Bash Read Grep Glob")
     # 写类和联网工具一律禁掉。注意这只挡工具本身：Bash 仍能写文件，
     # 快照的"只读"靠的是审完就删，不是文件系统权限。
@@ -875,8 +1013,68 @@ _agent_cmd_opencode() {
     local model="$1"
     # plan agent 默认就不带编辑能力，所以绝不能加 --auto。用户 shell 里 opencode 是个带
     # --auto 的 alias —— 脚本非交互执行不吃 alias，下面又统一经 env 直接 exec 二进制，天然绕开。
+    # --agent plan 还有一个必要作用：压过用户全局配置里的 default_agent。
     AGENT_CMD=(opencode run --agent plan)
     [[ -n "$model" ]] && AGENT_CMD+=(-m "$model")
+    AGENT_STDIN="$2"
+}
+
+# ─── opencode 认证注入 ───────────────────────────────────────
+# base_url + api_key + model 三者齐全时，生成一份临时 opencode 配置，把网关声明成
+# provider，用 OPENCODE_CONFIG 指给这次调用，用完删除。
+# 实测 v1.18.16：OPENCODE_CONFIG 是「在用户全局配置之上合并」而非替换（用户自己的
+# provider 仍然在列），所以这里只写 provider 块就够，用户的 ~/.config/opencode/opencode.json
+# 全程不被读写。三者缺一就整体不生效（回落到用户自己的 opencode 配置），
+# 不做"配一半"的中间状态。
+_OPENCODE_GW_PROVIDER="sparring-gw"
+_OPENCODE_GW_CONFIG=""
+
+# 密钥支持 $ENV_VAR 形式引用环境变量，这样配置文件里可以不落明文
+_resolve_secret() {
+    local raw="$1"
+    if [[ "$raw" == \$* ]]; then
+        local var="${raw#\$}"
+        printf '%s' "${!var:-}"
+    else
+        printf '%s' "$raw"
+    fi
+}
+
+# 成功时设置 _OPENCODE_GW_CONFIG（配置文件路径）并把要用的 model 打到 stdout；
+# 未配置网关时输出原样 model、_OPENCODE_GW_CONFIG 保持空。
+_opencode_gateway_setup() {
+    _OPENCODE_GW_CONFIG=""
+    local base_url api_key model
+    base_url=$(_config_get opencode.base_url)
+    api_key=$(_resolve_secret "$(_config_get opencode.api_key)")
+    model=$(_config_get opencode.model)
+
+    if [[ -z "$base_url" || -z "$api_key" || -z "$model" ]]; then
+        printf '%s' "$model"
+        return 0
+    fi
+
+    local f
+    if ! f=$(mktemp "${TMPDIR:-/tmp}/sparring-opencode-cfg.XXXXXX" 2>/dev/null); then
+        printf '%s' "$model"
+        return 0
+    fi
+    # 密钥落盘期间只对自己可读
+    chmod 600 "$f" 2>/dev/null || true
+    if ! jq -n \
+            --arg p "$_OPENCODE_GW_PROVIDER" \
+            --arg url "$base_url" \
+            --arg key "$api_key" \
+            --arg m "$model" \
+            '{provider: {($p): {npm: "@ai-sdk/openai-compatible", name: "Sparring Gateway",
+              options: {baseURL: $url, apiKey: $key}, models: {($m): {name: $m}}}}}' \
+            > "$f" 2>/dev/null; then
+        rm -f "$f" 2>/dev/null || true
+        printf '%s' "$model"
+        return 0
+    fi
+    _OPENCODE_GW_CONFIG="$f"
+    printf '%s/%s' "$_OPENCODE_GW_PROVIDER" "$model"
 }
 
 # 剥掉 agent CLI 的终端噪音：ANSI 序列 + "> plan · model" 这类进度头行。
@@ -887,21 +1085,66 @@ _strip_agent_noise() {
     sed -e "s/${esc}\[[0-9;?]*[A-Za-z]//g" -e "s/${esc}//g" -e '/^> .* · /d' -e '/./,$!d'
 }
 
+# opencode 腿的审查方法论。claude 腿不读它（用原生 /code-review）。
+# 文件缺失是安装坏了：宁可硬报错，也不要静默降级成一次没有方法论的弱审查。
+_adversarial_prompt() {
+    local file
+    file="$(_resolve_script_dir)/prompts/adversarial-review.md"
+    if [[ ! -f "$file" ]]; then
+        echo -e "${RED}错误: 找不到对抗式 review 方法论: ${file}${NC}" >&2
+        echo "  这份文件是 opencode 后端的审查方法论，缺了它审查质量无从保证。" >&2
+        return 1
+    fi
+    cat "$file"
+}
+
+# claude /code-review 的输出翻译成统一裁决契约。
+# 它的原生格式跟 APPROVE/CONCERNS 不是一回事：无问题时输出字面量 "(none)"，
+# 有问题时每行一条 "file:line — 描述"，两种情况都 exit 0。
+# 翻译成统一契约后，上层 _review_run 的裁决解析对两条腿是同一套。
+# 认不出来的一律返回失败（reason=parse），绝不默认放行。
+_normalize_code_review_output() {
+    local out="$1" level="$2"
+    local trimmed
+    trimmed=$(printf '%s' "$out" | tr -d '[:space:]')
+    if [[ "$trimmed" == "(none)" ]]; then
+        printf 'APPROVE\n\nclaude /code-review %s 走完未发现问题。\n' "$level"
+        return 0
+    fi
+    # 只要**有任一行**是 finding 形态就算 CONCERNS：多行 finding 的续行本来就不匹配，
+    # 要求整份输出每行都匹配会把正常结果误判成解析失败。
+    if printf '%s' "$out" | grep -qE '^[^[:space:]]+:[0-9]+[[:space:]]'; then
+        printf 'CONCERNS\n\n%s\n' "$out"
+        return 0
+    fi
+    return 1
+}
+
 # _call_backend <backend> <prompt> [run_cwd]
 # 在 run_cwd 里跑指定后端的 reviewer agent，裁决文本打到 stdout。
-# prompt 一律走 stdin（两个 CLI 都支持），避免大 prompt 撞 ARG_MAX。
+# prompt 的用法随后端和模式变：claude+range 拼进 /code-review 的参数，其余走 stdin
+# （避免大 prompt 撞 ARG_MAX）。
 # run_cwd 决定 reviewer 能看到什么：range 审查传只读快照，纯文本审查留空 → 临时空目录。
+# 失败时经 _error_reason_record 记下原因（timeout/crash/empty/parse），不留静默挂死。
 _call_backend() {
     local backend="$1"
     local prompt="$2"
     local run_cwd="${3:-}"
 
-    check_backend "$backend" || return 1
+    check_backend "$backend" || { _error_reason_record crash; return 1; }
 
     local model use_proxy extra_args
-    model=$(_config_get "${backend}.model")
     use_proxy=$(_config_get "${backend}.use_proxy")
     extra_args=$(_config_get "${backend}.extra_args")
+
+    # opencode 的 model 可能被网关注入改写成 <provider>/<model>
+    local gw_config=""
+    if [[ "$backend" == "opencode" ]]; then
+        model=$(_opencode_gateway_setup)
+        gw_config="$_OPENCODE_GW_CONFIG"
+    else
+        model=$(_config_get "${backend}.model")
+    fi
 
     local ephemeral_cwd=""
     if [[ -z "$run_cwd" ]]; then
@@ -909,54 +1152,89 @@ _call_backend() {
         ephemeral_cwd="$run_cwd"
     fi
 
+    # 喂给后端的输入：range 模式下 claude 拿附加指令、opencode 拿完整方法论 + 指令。
+    local payload="$prompt"
+    if [[ "$_RV_MODE" == "range" && "$backend" == "opencode" ]]; then
+        local methodology
+        if ! methodology=$(_adversarial_prompt); then
+            [[ -n "$ephemeral_cwd" ]] && rm -rf "$ephemeral_cwd"
+            _error_reason_record crash
+            return 1
+        fi
+        payload="${methodology}"$'\n\n---\n\n'
+        payload="${payload}审查强度 ${_RV_LEVEL}：$(_level_directive "$_RV_LEVEL")"$'\n\n'
+        payload="${payload}$(_range_review_prompt "$_RV_RANGE" "$_RV_RIGHT")"$'\n\n'
+        payload="${payload}${prompt}"
+    elif [[ "$_RV_MODE" != "range" ]]; then
+        payload="$(_reviewer_role_prompt)"$'\n'"$prompt"
+    fi
+
     AGENT_CMD=()
+    AGENT_STDIN=""
     case "$backend" in
-        claude)   _agent_cmd_claude "$model" ;;
-        opencode) _agent_cmd_opencode "$model" ;;
+        claude)   _agent_cmd_claude "$model" "$payload" ;;
+        opencode) _agent_cmd_opencode "$model" "$payload" ;;
     esac
     # shellcheck disable=SC2206  # 有意按空格拆成多个参数
     [[ -n "$extra_args" ]] && AGENT_CMD+=($extra_args)
 
     local -a envs=()
     [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+    [[ -n "$gw_config" ]] && envs+=("OPENCODE_CONFIG=${gw_config}")
 
     local prompt_file output_file log_file
     prompt_file=$(mktemp "${TMPDIR:-/tmp}/sparring-prompt.XXXXXX")
     output_file=$(mktemp "${TMPDIR:-/tmp}/sparring-out.XXXXXX")
     log_file=$(mktemp "${TMPDIR:-/tmp}/sparring-log.XXXXXX")
-    { _reviewer_role_prompt; printf '\n%s\n' "$prompt"; } > "$prompt_file"
+    # AGENT_STDIN 为空时写空文件：CLI 读到即时 EOF，不会挂在等输入上
+    printf '%s' "$AGENT_STDIN" > "$prompt_file"
 
     # 清理：每个 return 前显式 rm。不用 trap RETURN —— 本函数在
     # result=$(_call_backend ...) 子 shell 里跑且脚本 set -u；RETURN trap 是全局状态，
     # 会在外层 call_reviewer 返回时再次触发，那里 $_cleanup 未定义 → unbound variable。
     local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\""
     [[ -n "$ephemeral_cwd" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cwd\""
+    [[ -n "$gw_config" ]] && _cleanup="$_cleanup; rm -f \"$gw_config\""
 
     local label timeout_s max_attempts
     label=$(reviewer_label_for_backend "$backend")
     timeout_s=$(_agent_timeout)
     max_attempts=$(_agent_attempts)
     echo -e "${DIM}  使用 ${label} | 模型: ${model:-default} | 工作目录: ${run_cwd}${NC}" >&2
+    [[ -n "$gw_config" ]] && echo -e "${DIM}  经 opencode.base_url 网关（临时配置，用完删）${NC}" >&2
 
-    local i ok=false
+    local i ok=false rc=0 last_rc=0
+    _heartbeat_start "$label"
     for i in $(seq 1 "$max_attempts"); do
-        if ( cd "$run_cwd" && _timeout_cmd "$timeout_s" \
+        rc=0
+        ( cd "$run_cwd" && _timeout_cmd "$timeout_s" \
                 env ${envs[@]+"${envs[@]}"} "${AGENT_CMD[@]}" \
-                < "$prompt_file" > "$output_file" 2>"$log_file" ); then
+                < "$prompt_file" > "$output_file" 2>"$log_file" ) || rc=$?
+        if [[ $rc -eq 0 ]]; then
             ok=true
             break
         fi
+        last_rc=$rc
         if [[ $i -lt $max_attempts ]]; then
-            echo -e "${DIM}  ${backend} 调用失败，重试 ($i/$max_attempts)...${NC}" >&2
+            local why="退出码 ${rc}"
+            [[ $rc -eq 124 ]] && why="超时 ${timeout_s}s"
+            echo -e "${DIM}  ${backend} 调用失败（${why}），重试 ($i/$max_attempts)...${NC}" >&2
             sleep 2
         fi
     done
+    _heartbeat_stop
 
     if [[ "$ok" != true ]]; then
         local err_output
         err_output=$(tail -c 400 "$log_file" 2>/dev/null || true)
         eval "$_cleanup"
-        echo -e "${RED}错误: ${backend} 调用失败 (共 ${max_attempts} 次尝试)${NC}" >&2
+        if [[ $last_rc -eq 124 ]]; then
+            _error_reason_record timeout
+            echo -e "${RED}错误: ${backend} 超时 ${timeout_s}s，已杀掉整个进程组 (共 ${max_attempts} 次尝试)${NC}" >&2
+        else
+            _error_reason_record crash
+            echo -e "${RED}错误: ${backend} 调用失败，退出码 ${last_rc} (共 ${max_attempts} 次尝试)${NC}" >&2
+        fi
         [[ -n "$err_output" ]] && echo -e "${DIM}  错误信息: ${err_output}${NC}" >&2
         return 1
     fi
@@ -966,8 +1244,21 @@ _call_backend() {
     eval "$_cleanup"
 
     if [[ "$result" != *[![:space:]]* ]]; then
+        _error_reason_record empty
         echo -e "${RED}错误: ${backend} 返回空结果${NC}" >&2
         return 1
+    fi
+
+    # claude 的 range 审查走原生 /code-review，输出格式跟统一契约不同，这里翻译
+    if [[ "$backend" == "claude" && "$_RV_MODE" == "range" ]]; then
+        local normalized
+        if ! normalized=$(_normalize_code_review_output "$result" "$_RV_LEVEL"); then
+            _error_reason_record parse
+            echo -e "${RED}错误: 无法解析 claude /code-review 的输出${NC}" >&2
+            echo -e "${DIM}  原始输出前 200 字符: ${result:0:200}${NC}" >&2
+            return 1
+        fi
+        result="$normalized"
     fi
 
     printf '%s\n' "$result"
@@ -1120,11 +1411,13 @@ _review_log_retention_days() {
     printf '%s' "$days"
 }
 
-# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via> [mode] [range]
+# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via> [mode] [range] [level] [error_reason]
 # mode: range（审 git range）| text（审一段文本）；range 字段无则 null。
+# error_reason: timeout|crash|empty|parse，只在 verdict=ERROR 时有值——排查"静默挂了"
+# 的第一手依据，没有它只能看到一个 exit 1。
 _review_log_append() {
     local exit_code="$1" verdict="$2" title="$3" input_lines="$4" duration_s="$5" backend="$6" via="$7"
-    local mode="${8:-text}" range="${9:-}"
+    local mode="${8:-text}" range="${9:-}" level="${10:-}" error_reason="${11:-}"
     local days
     days=$(_review_log_retention_days)
     [[ "$days" == "0" ]] && return 0
@@ -1145,12 +1438,16 @@ _review_log_append() {
         --arg verdict "$verdict" \
         --arg mode "$mode" \
         --arg range "$range" \
+        --arg level "$level" \
+        --arg error_reason "$error_reason" \
         --argjson input_lines "$input_lines" \
         --argjson duration_s "$duration_s" \
         --argjson exit_code "$exit_code" \
         '{ts: $ts, title: $title, mode: $mode, range: (if $range == "" then null else $range end),
+          level: (if $level == "" then null else $level end),
           input_lines: $input_lines, backend: $backend,
-          via: $via, duration_s: $duration_s, exit_code: $exit_code, verdict: $verdict}' \
+          via: $via, duration_s: $duration_s, exit_code: $exit_code, verdict: $verdict,
+          error_reason: (if $error_reason == "" then null else $error_reason end)}' \
         >> "${dir}/review-$(date +%Y%m%d).jsonl" 2>/dev/null || true
 }
 
@@ -1159,28 +1456,37 @@ _review_log_append() {
 _review_run() {
     local prompt="$1" run_cwd="$2" title="$3" mode="$4" range="$5" input_lines="$6"
 
-    # 执行日志采集：起始时间 + 实际后端状态文件
-    # （call_reviewer 在命令替换 subshell 里跑，靠文件把 backend/via 传回来）
-    local _log_t0 _log_state
+    # 执行日志采集：起始时间 + 实际后端状态文件 + 失败原因文件
+    # （call_reviewer 在命令替换 subshell 里跑，靠文件把 backend/via/reason 传回来）
+    local _log_t0 _log_state _log_reason_file
     _log_t0=$(date +%s)
     _log_state=$(mktemp "${TMPDIR:-/tmp}/sparring-review-state.XXXXXX" 2>/dev/null) || _log_state=""
     [[ -n "$_log_state" ]] && SPARRING_BACKEND_STATE_FILE="$_log_state"
+    _log_reason_file=$(mktemp "${TMPDIR:-/tmp}/sparring-review-reason.XXXXXX" 2>/dev/null) || _log_reason_file=""
+    [[ -n "$_log_reason_file" ]] && SPARRING_ERROR_REASON_FILE="$_log_reason_file"
 
     local result rc=0
     result=$(call_reviewer "$prompt" "$run_cwd") || rc=$?
 
-    local _log_backend="" _log_via="" _log_dur
+    local _log_backend="" _log_via="" _log_dur _log_reason=""
     if [[ -n "$_log_state" && -s "$_log_state" ]]; then
         # 状态文件是尝试链（每行一次尝试），末行 = 最终实际使用的后端
         read -r _log_backend _log_via <<< "$(tail -n 1 "$_log_state" 2>/dev/null)" || true
     fi
+    if [[ -n "$_log_reason_file" && -s "$_log_reason_file" ]]; then
+        _log_reason=$(tr -d '\n' < "$_log_reason_file" 2>/dev/null) || _log_reason=""
+    fi
     [[ -n "$_log_state" ]] && rm -f "$_log_state" 2>/dev/null
-    unset SPARRING_BACKEND_STATE_FILE
+    [[ -n "$_log_reason_file" ]] && rm -f "$_log_reason_file" 2>/dev/null
+    unset SPARRING_BACKEND_STATE_FILE SPARRING_ERROR_REASON_FILE
     _log_dur=$(( $(date +%s) - _log_t0 ))
 
     if [[ $rc -ne 0 ]]; then
+        # 原因文件没写上说明是调用层之外的失败（比如 backend 名非法），归 crash
+        [[ -z "$_log_reason" ]] && _log_reason="crash"
+        echo -e "${RED}✗ review 未完成，原因: ${_log_reason}${NC}" >&2
         _review_log_append "$rc" ERROR "$title" "$input_lines" "$_log_dur" \
-            "$_log_backend" "$_log_via" "$mode" "$range"
+            "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" "$_log_reason"
         return $rc
     fi
 
@@ -1194,18 +1500,18 @@ _review_run() {
     case "$verdict" in
         APPROVE)
             _review_log_append 0 APPROVE "$title" "$input_lines" "$_log_dur" \
-                "$_log_backend" "$_log_via" "$mode" "$range"
+                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" ""
             return 0
             ;;
         CONCERNS)
             _review_log_append 2 CONCERNS "$title" "$input_lines" "$_log_dur" \
-                "$_log_backend" "$_log_via" "$mode" "$range"
+                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" ""
             return 2
             ;;
         *)
             echo -e "${YELLOW}⚠ 无法从 reviewer 输出解析出 APPROVE/CONCERNS 裁决，按调用错误处理（exit 1）${NC}" >&2
             _review_log_append 1 ERROR "$title" "$input_lines" "$_log_dur" \
-                "$_log_backend" "$_log_via" "$mode" "$range"
+                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" parse
             return 1
             ;;
     esac
@@ -1213,7 +1519,7 @@ _review_run() {
 
 # 在只读快照里审一段 git range
 _review_range() {
-    local range="$1" title="$2"
+    local range="$1" title="$2" level="$3"
 
     if ! git rev-parse --git-dir >/dev/null 2>&1; then
         echo -e "${RED}错误: --range 需要在 git 仓库里执行${NC}" >&2
@@ -1246,12 +1552,19 @@ _review_range() {
     fi
     echo -e "${DIM}  只读快照: ${_REVIEW_SNAPSHOT} (detached ${right})${NC}" >&2
 
-    local prompt
-    prompt=$(_range_review_prompt "$range" "$right")
-    [[ -n "$title" ]] && prompt="【审查主题】${title}"$'\n\n'"$prompt"
+    # 审查上下文交给后端层：claude 拼进 /code-review 的参数，opencode 拼进注入的方法论
+    _RV_MODE="range"
+    _RV_RANGE="$range"
+    _RV_RIGHT="$right"
+    _RV_LEVEL="$level"
+
+    # 这里只给"附加审查指令"——去哪看、怎么看由各后端自己补：claude 的 /code-review
+    # 自带方法论，opencode 由 prompts/adversarial-review.md 注入。
+    local prompt="请特别注意：只报本次改动引入或暴露的真实问题，每条都要给出 file:line 和一个具体的失败场景。"
+    [[ -n "$title" ]] && prompt="审查主题：${title}"$'\n'"$prompt"
     local conventions
     conventions=$(load_review_conventions)
-    [[ -n "$conventions" ]] && prompt="$prompt"$'\n\n## Review 约定\n'"$conventions"
+    [[ -n "$conventions" ]] && prompt="$prompt"$'\n\n本项目的 Review 约定：\n'"$conventions"
 
     local rc=0
     _review_run "$prompt" "$_REVIEW_SNAPSHOT" "$title" range "$range" "$input_lines" || rc=$?
@@ -1265,6 +1578,8 @@ review_adhoc() {
     local title=""
     local content=""
     local range=""
+    local level=""
+    local level_explicit=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --title)
@@ -1283,9 +1598,21 @@ review_adhoc() {
                 range="$2"
                 shift 2
                 ;;
+            --level)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo -e "${RED}错误: --level 需要一个参数（${REVIEW_LEVELS}）${NC}" >&2
+                    return 1
+                fi
+                if ! level=$(_normalize_level "$2"); then
+                    echo -e "${RED}错误: 不支持的 level: '$2'（仅支持 ${REVIEW_LEVELS}）${NC}" >&2
+                    return 1
+                fi
+                level_explicit=true
+                shift 2
+                ;;
             -h|--help)
                 cat >&2 <<'USAGE'
-用法: sparring review [--title <主题>] (--range <git-range> | [<内容>])
+用法: sparring review [--title <主题>] [--level <强度>] (--range <git-range> | [<内容>])
   reviewer 是个 agent：给它 range 它自己去仓库里查，给它文本它就事论事裁决。
   退出码: 0=APPROVE  2=CONCERNS  1=调用错误
 
@@ -1297,18 +1624,26 @@ review_adhoc() {
 
   ⚠ 不再接收 diff 文本（`git diff | sparring review` 会直接报错）——改用 --range。
 
+--level <低到高: low / medium / high / xhigh>  默认 medium (config: review.level)
+  low 少而准，xhigh 穷尽式（更慢、噪音更多）。只对 --range 有意义。
+
 后端 (config review.backend，默认 claude；fallback 默认 opencode):
-  claude    Claude Code CLI，开 Bash + 只读工具，禁写类/联网工具
-  opencode  opencode run --agent plan
+  claude    Claude Code 原生 /code-review，开 Bash + 只读工具，禁写类/联网工具
+  opencode  opencode run --agent plan，方法论由 prompts/adversarial-review.md 注入
+
+进程管理（每次 review 只有三种结局，不存在静默挂死）:
+  APPROVE / CONCERNS / 带原因的 ERROR（timeout|crash|empty|parse）
+  超时（config review.timeout，默认 600s）杀掉整个进程组，不留孤儿进程；
+  运行期间每 15s 往 stderr 打一行心跳。
 
 执行日志（排查超时/降级用）:
   每次调用追加一行 JSONL 到 ~/.local/state/sparring/review-YYYYMMDD.jsonl
-  （字段: ts/title/mode/range/input_lines/backend/via/duration_s/exit_code/verdict），
-  默认保留 7 天（config: review.log_retention_days，0 = 禁用）。
+  （字段: ts/title/mode/range/level/input_lines/backend/via/duration_s/exit_code/
+   verdict/error_reason），默认保留 7 天（config: review.log_retention_days，0 = 禁用）。
 
 示例:
   sparring review --range origin/main...HEAD
-  sparring review --range HEAD~3..HEAD --title "登录重构"
+  sparring review --range HEAD~3..HEAD --level high --title "登录重构"
   echo "<上下文+结论>" | sparring review
 USAGE
                 return 0
@@ -1323,6 +1658,11 @@ USAGE
     # range 模式一律不读 stdin。非交互环境（CI / agent 子进程）里 stdin 常是个
     # 永远不关闭的管道，`cat` 会一直阻塞 —— 实测 `sparring review --range X` 直接卡死。
     # range 的输入本来就来自 git，不需要 stdin；真有人管道送了东西就提醒一句被忽略了。
+    # 未显式指定就取配置默认（config review.level，内置 medium）
+    if [[ -z "$level" ]]; then
+        level=$(get_review_level) || return 1
+    fi
+
     if [[ -n "$range" ]]; then
         if [[ "$content" == *[![:space:]]* ]]; then
             echo -e "${RED}错误: --range 和文本内容不能同时给${NC}" >&2
@@ -1331,7 +1671,7 @@ USAGE
             return 1
         fi
         [[ -p /dev/stdin ]] && echo -e "${YELLOW}⚠ --range 模式不读 stdin，管道里的内容已忽略${NC}" >&2
-        _review_range "$range" "$title"
+        _review_range "$range" "$title" "$level"
         return $?
     fi
 
@@ -1362,6 +1702,13 @@ USAGE
         echo "  reviewer 会在只读快照里自己跑 git diff，不再有体量上限，也不用分片。" >&2
         return 1
     fi
+
+    # 文本模式没有 level 这回事：claude 走不到 /code-review，opencode 也没有代码可挖深。
+    # 记 null 而不是记一个没生效的值，免得日志读起来像"审过 high 了"。
+    $level_explicit && echo -e "${YELLOW}⚠ --level 只对 --range 生效，本次审的是文本，已忽略${NC}" >&2
+    _RV_MODE="text"
+    _RV_RANGE=""
+    _RV_LEVEL=""
 
     local prompt="以下是需要你审查的内容（是一段结论/方案文本，不是代码仓库，就事论事审）：
 
@@ -2668,6 +3015,15 @@ _validate_backend_env() {
         [[ -z "$val" ]] && continue
         if ! _normalize_backend "$val" >/dev/null 2>&1; then
             echo -e "${RED}错误: ${var}='${val}' 不是合法 backend（仅支持 ${REVIEW_BACKENDS}）${NC}" >&2
+            exit 1
+        fi
+    done
+
+    for var in SPARRING_REVIEW_LEVEL WORKFLOW_REVIEW_LEVEL; do
+        val="${!var:-}"
+        [[ -z "$val" ]] && continue
+        if ! _normalize_level "$val" >/dev/null 2>&1; then
+            echo -e "${RED}错误: ${var}='${val}' 不是合法 level（仅支持 ${REVIEW_LEVELS}）${NC}" >&2
             exit 1
         fi
     done

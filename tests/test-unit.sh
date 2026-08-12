@@ -1831,6 +1831,377 @@ test_call_reviewer_state_unset_noop() {
 }
 test_call_reviewer_state_unset_noop
 
+echo ""
+echo "=== 超时杀整棵进程树 ==="
+
+# 只杀直接子进程的实现能骗过"假 backend 只 sleep 一下"的测试：主进程一死测试就绿了。
+# 所以假 backend 必须派生孙进程，断言打在孙进程上——这正是最贵的那种静默挂死：
+# sparring 报超时退出了，被杀的只有壳，真正烧额度的 agent 子进程还在后台跑。
+# marker 用一个不会跟系统里其他 sleep 撞车的秒数，pgrep 才能精确定位。
+TREE_MARKER=98765
+
+_make_tree_backend() {
+    local script="$1"
+    cat > "$script" <<EOF
+#!/bin/bash
+# 孙进程：超时只 kill 直接子进程的话，它会活下来
+sleep ${TREE_MARKER} &
+sleep ${TREE_MARKER}
+EOF
+    chmod +x "$script"
+}
+
+_tree_survivors() {
+    pgrep -f "sleep ${TREE_MARKER}" 2>/dev/null | wc -l | tr -d ' '
+}
+
+test_timeout_kills_process_tree_gnu() {
+    source_workflow_funcs
+    pkill -f "sleep ${TREE_MARKER}" 2>/dev/null || true
+    if ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+        echo "  - 跳过：本机无 GNU timeout"
+        return 0
+    fi
+    local script="$TMP_DIR/fake-backend-tree.sh"
+    _make_tree_backend "$script"
+
+    local rc=0
+    _timeout_cmd 1 "$script" >/dev/null 2>&1 || rc=$?
+    assert_eq "GNU timeout 路径返回 124" "124" "$rc"
+    sleep 1
+    assert_eq "GNU timeout 路径：孙进程无残留" "0" "$(_tree_survivors)"
+    pkill -f "sleep ${TREE_MARKER}" 2>/dev/null || true
+}
+test_timeout_kills_process_tree_gnu
+
+test_timeout_kills_process_tree_perl() {
+    source_workflow_funcs
+    pkill -f "sleep ${TREE_MARKER}" 2>/dev/null || true
+    # PATH 限制到 /usr/bin:/bin 逼出 perl fallback（没装 coreutils 的 macOS 走这条）
+    if PATH="/usr/bin:/bin" command -v timeout >/dev/null 2>&1 \
+        || PATH="/usr/bin:/bin" command -v gtimeout >/dev/null 2>&1; then
+        echo "  - 跳过：/usr/bin:/bin 下存在 timeout，无法逼出 perl fallback"
+        return 0
+    fi
+    if ! PATH="/usr/bin:/bin" command -v perl >/dev/null 2>&1; then
+        echo "  - 跳过：/usr/bin:/bin 下无 perl，fallback 不可测"
+        return 0
+    fi
+    local script="$TMP_DIR/fake-backend-tree-perl.sh"
+    _make_tree_backend "$script"
+
+    local rc=0
+    ( PATH="/usr/bin:/bin:$PATH"; _timeout_cmd 1 "$script" ) >/dev/null 2>&1 || rc=$?
+    assert_eq "perl fallback 返回 124" "124" "$rc"
+    sleep 1
+    assert_eq "perl fallback：孙进程无残留（setpgrp + kill 负 pid）" "0" "$(_tree_survivors)"
+    pkill -f "sleep ${TREE_MARKER}" 2>/dev/null || true
+}
+test_timeout_kills_process_tree_perl
+
+echo ""
+echo "=== 心跳 ==="
+
+test_heartbeat_start_stop() {
+    source_workflow_funcs
+    _heartbeat_start "测试后端"
+    local hb_pid="$_HEARTBEAT_PID"
+    if [[ -n "$hb_pid" ]] && kill -0 "$hb_pid" 2>/dev/null; then
+        echo "  ✓ 心跳进程已启动"; ((PASS++))
+    else
+        echo "  ✗ 心跳进程没起来"; ((FAIL++))
+    fi
+    _heartbeat_stop
+    assert_eq "停止后全局 PID 清空" "" "$_HEARTBEAT_PID"
+    if kill -0 "$hb_pid" 2>/dev/null; then
+        echo "  ✗ 心跳进程未被回收"; ((FAIL++))
+    else
+        echo "  ✓ 心跳进程已回收"; ((PASS++))
+    fi
+    # 幂等：重复 stop 不报错
+    local rc=0
+    _heartbeat_stop || rc=$?
+    assert_eq "重复 stop 幂等" "0" "$rc"
+}
+test_heartbeat_start_stop
+
+echo ""
+echo "=== level ==="
+
+test_normalize_level() {
+    source_workflow_funcs
+    assert_eq "low" "low" "$(_normalize_level low)"
+    assert_eq "大小写归一" "xhigh" "$(_normalize_level XHIGH)"
+    assert_eq "medium" "medium" "$(_normalize_level Medium)"
+    local rc=0
+    _normalize_level "ultra" >/dev/null 2>&1 || rc=$?
+    assert_eq "非法 level 返回非 0" "1" "$rc"
+    rc=0
+    _normalize_level "" >/dev/null 2>&1 || rc=$?
+    assert_eq "空 level 返回非 0" "1" "$rc"
+}
+test_normalize_level
+
+test_review_level_config() {
+    source_workflow_funcs
+    assert_eq "默认 medium" "medium" "$(get_review_level)"
+    echo '{"review":{"level":"high"}}' > "$CONFIG_FILE_GLOBAL"
+    assert_eq "global 配置生效" "high" "$(get_review_level)"
+    assert_eq "env 覆盖配置" "low" "$(SPARRING_REVIEW_LEVEL=low get_review_level)"
+    echo '{"review":{"level":"nonsense"}}' > "$CONFIG_FILE_GLOBAL"
+    local rc=0
+    get_review_level >/dev/null 2>&1 || rc=$?
+    assert_eq "非法配置值报错" "1" "$rc"
+    rm -f "$CONFIG_FILE_GLOBAL"
+}
+test_review_level_config
+
+test_level_directive_all_levels() {
+    source_workflow_funcs
+    local lv
+    for lv in low medium high xhigh; do
+        local d
+        d=$(_level_directive "$lv")
+        if [[ -n "$d" ]]; then
+            echo "  ✓ ${lv} 有对应的强度说明"; ((PASS++))
+        else
+            echo "  ✗ ${lv} 没有强度说明（opencode 腿会丢掉 level 语义）"; ((FAIL++))
+        fi
+    done
+}
+test_level_directive_all_levels
+
+echo ""
+echo "=== /code-review 输出翻译 ==="
+
+test_code_review_none_is_approve() {
+    source_workflow_funcs
+    local out
+    out=$(_normalize_code_review_output "(none)" low)
+    assert_eq "(none) → 首行 APPROVE" "APPROVE" "$(echo "$out" | head -1)"
+    # 引擎输出常带尾随换行/空格
+    out=$(_normalize_code_review_output "  (none)
+" medium)
+    assert_eq "前后空白容忍" "APPROVE" "$(echo "$out" | head -1)"
+}
+test_code_review_none_is_approve
+
+test_code_review_findings_is_concerns() {
+    source_workflow_funcs
+    local findings="src/user.js:3 — opts 未判空，老调用方会崩
+src/cart.js:16 — off 缺省时结果是 NaN"
+    local out rc=0
+    out=$(_normalize_code_review_output "$findings" low) || rc=$?
+    assert_eq "findings 解析成功" "0" "$rc"
+    assert_eq "首行 CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
+    assert_contains "findings 原样透出" "src/user.js:3" "$out"
+    assert_contains "第二条也在" "src/cart.js:16" "$out"
+}
+test_code_review_findings_is_concerns
+
+test_code_review_multiline_finding() {
+    source_workflow_funcs
+    # 多行 finding 的续行不是 file:line 形态——按"每行都要匹配"判会误判成解析失败
+    local findings="src/a.py:10 — 空指针
+    详细说明：当输入为 None 时
+    影响：500"
+    local out rc=0
+    out=$(_normalize_code_review_output "$findings" high) || rc=$?
+    assert_eq "多行 finding 仍算 CONCERNS" "0" "$rc"
+    assert_eq "首行 CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
+}
+test_code_review_multiline_finding
+
+test_code_review_garbage_is_parse_error() {
+    source_workflow_funcs
+    local rc=0
+    _normalize_code_review_output "我看了一下，感觉还行" low >/dev/null 2>&1 || rc=$?
+    assert_eq "认不出的输出 → 解析失败（绝不默认放行）" "1" "$rc"
+    rc=0
+    _normalize_code_review_output "Error: API rate limited" low >/dev/null 2>&1 || rc=$?
+    assert_eq "报错文本 → 解析失败" "1" "$rc"
+}
+test_code_review_garbage_is_parse_error
+
+echo ""
+echo "=== 失败原因回传 ==="
+
+test_error_reason_record() {
+    source_workflow_funcs
+    local f="$TMP_DIR/reason.txt"
+    SPARRING_ERROR_REASON_FILE="$f" _error_reason_record timeout
+    assert_eq "原因写入文件" "timeout" "$(cat "$f")"
+    # 后写覆盖先写：末次失败原因才是要报的那个
+    SPARRING_ERROR_REASON_FILE="$f" _error_reason_record parse
+    assert_eq "覆盖而非追加" "parse" "$(cat "$f")"
+    # 未设文件时是 no-op，不报错
+    local rc=0
+    unset SPARRING_ERROR_REASON_FILE
+    _error_reason_record crash || rc=$?
+    assert_eq "未设文件时 no-op" "0" "$rc"
+}
+test_error_reason_record
+
+test_review_log_level_and_reason_fields() {
+    source_workflow_funcs
+    local state_dir="$TMP_DIR/state-lv"
+    mkdir -p "$state_dir"
+    XDG_STATE_HOME="$state_dir" _review_log_append 1 ERROR "超时的活" 10 600 claude primary range "main...HEAD" high timeout
+    local line
+    line=$(cat "$state_dir/sparring/review-$(date +%Y%m%d).jsonl")
+    assert_eq "level 字段" "high" "$(echo "$line" | jq -r '.level')"
+    assert_eq "error_reason 字段" "timeout" "$(echo "$line" | jq -r '.error_reason')"
+    assert_eq "mode 字段" "range" "$(echo "$line" | jq -r '.mode')"
+
+    # 正常裁决时两个字段的形态：level 有值、error_reason 为 null
+    XDG_STATE_HOME="$state_dir" _review_log_append 0 APPROVE "过了的活" 10 30 claude primary range "main...HEAD" low ""
+    line=$(tail -1 "$state_dir/sparring/review-$(date +%Y%m%d).jsonl")
+    assert_eq "APPROVE 时 error_reason 为 null" "null" "$(echo "$line" | jq -r '.error_reason')"
+    assert_eq "APPROVE 时 level 有值" "low" "$(echo "$line" | jq -r '.level')"
+
+    # 文本模式不记 level（没生效的值不该出现在日志里）
+    XDG_STATE_HOME="$state_dir" _review_log_append 0 APPROVE "审文本" 5 3 opencode primary text "" "" ""
+    line=$(tail -1 "$state_dir/sparring/review-$(date +%Y%m%d).jsonl")
+    assert_eq "text 模式 level 为 null" "null" "$(echo "$line" | jq -r '.level')"
+}
+test_review_log_level_and_reason_fields
+
+echo ""
+echo "=== 背景 job 死 PID 改判 ==="
+
+_write_job_json() {
+    local path="$1" status="$2" pid="$3"
+    jq -n --arg s "$status" --argjson p "$pid" \
+        '{job_id: "rj-test-0001", task_id: "t1", review_type: "code", backend: "claude",
+          status: $s, created_at: "2026-08-12T00:00:00+08:00", started_at: null,
+          completed_at: null, pid: (if $p == 0 then null else $p end),
+          exit_code: null, error_reason: null, review_state: null,
+          review_file: null, result_file: null, log_file: null}' > "$path"
+}
+
+test_job_reap_dead_pid() {
+    source_workflow_funcs
+    local job="$TMP_DIR/job-dead.json"
+    # 起一个进程再杀掉，拿到一个确定已死的 PID（比硬编码 PID 可靠：
+    # 硬编码的号码可能被系统回收给别的进程，测试就会随机变绿）
+    sleep 60 & local dead_pid=$!
+    kill "$dead_pid" 2>/dev/null; wait "$dead_pid" 2>/dev/null
+    _write_job_json "$job" running "$dead_pid"
+
+    _review_job_reap "$job" 2>/dev/null
+    assert_eq "running + 死 PID → failed" "failed" "$(jq -r '.status' "$job")"
+    assert_eq "记 error_reason" "crash" "$(jq -r '.error_reason' "$job")"
+    assert_eq "pid 置空" "null" "$(jq -r '.pid' "$job")"
+    assert_eq "原 pid 搬到 final_pid" "$dead_pid" "$(jq -r '.final_pid' "$job")"
+}
+test_job_reap_dead_pid
+
+test_job_reap_keeps_live_worker() {
+    source_workflow_funcs
+    local job="$TMP_DIR/job-live.json"
+    sleep 30 & local live_pid=$!
+    _write_job_json "$job" running "$live_pid"
+
+    _review_job_reap "$job" 2>/dev/null
+    assert_eq "worker 还活着就不动它" "running" "$(jq -r '.status' "$job")"
+    kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
+}
+test_job_reap_keeps_live_worker
+
+test_job_reap_ignores_completed() {
+    source_workflow_funcs
+    # 正常完成的 job：pid 已置 null、值搬到 final_pid。
+    # 只看 kill -0 会把它误判成 failed，所以必须要求 pid 非 null。
+    local job="$TMP_DIR/job-done.json"
+    _write_job_json "$job" completed 0
+    _review_job_reap "$job" 2>/dev/null
+    assert_eq "已完成的 job 不被改判" "completed" "$(jq -r '.status' "$job")"
+
+    local job2="$TMP_DIR/job-done-running.json"
+    _write_job_json "$job2" running 0
+    _review_job_reap "$job2" 2>/dev/null
+    assert_eq "running 但 pid 为 null 时不改判" "running" "$(jq -r '.status' "$job2")"
+}
+test_job_reap_ignores_completed
+
+echo ""
+echo "=== opencode 网关认证注入 ==="
+
+test_resolve_secret() {
+    source_workflow_funcs
+    assert_eq "字面量原样返回" "sk-literal" "$(_resolve_secret 'sk-literal')"
+    assert_eq "\$ENV_VAR 解引用" "sk-from-env" "$(SPARRING_TEST_KEY=sk-from-env _resolve_secret '$SPARRING_TEST_KEY')"
+    assert_eq "未设置的 env 解成空" "" "$(_resolve_secret '$SPARRING_DEFINITELY_UNSET_VAR')"
+    assert_eq "空值" "" "$(_resolve_secret '')"
+}
+test_resolve_secret
+
+test_gateway_not_configured() {
+    source_workflow_funcs
+    echo '{"opencode":{"model":"some/model"}}' > "$CONFIG_FILE_GLOBAL"
+    local m
+    m=$(_opencode_gateway_setup)
+    assert_eq "未配网关时 model 原样透传" "some/model" "$m"
+    assert_eq "不生成临时配置" "" "$_OPENCODE_GW_CONFIG"
+    rm -f "$CONFIG_FILE_GLOBAL"
+}
+test_gateway_not_configured
+
+test_gateway_partial_config_ignored() {
+    source_workflow_funcs
+    # 配一半（有 url 没 key）不能半生效——那会变成"以为走网关、其实走用户默认账号"
+    echo '{"opencode":{"model":"m1","base_url":"https://gw.example/v1"}}' > "$CONFIG_FILE_GLOBAL"
+    local m
+    m=$(_opencode_gateway_setup)
+    assert_eq "缺 api_key 时不启用网关" "m1" "$m"
+    assert_eq "缺 api_key 时无临时配置" "" "$_OPENCODE_GW_CONFIG"
+    rm -f "$CONFIG_FILE_GLOBAL"
+}
+test_gateway_partial_config_ignored
+
+test_gateway_generates_config() {
+    source_workflow_funcs
+    jq -n '{opencode: {model: "gpt-test", base_url: "https://gw.example/v1", api_key: "$SPARRING_TEST_GW_KEY"}}' \
+        > "$CONFIG_FILE_GLOBAL"
+    local m
+    m=$(SPARRING_TEST_GW_KEY=sk-secret-from-env _opencode_gateway_setup)
+    # _opencode_gateway_setup 在 $(...) 子 shell 里跑，全局变量传不回来，
+    # 所以这里重跑一次拿文件路径（同样的输入，行为一致）
+    SPARRING_TEST_GW_KEY=sk-secret-from-env _opencode_gateway_setup >/dev/null
+    local cfg="$_OPENCODE_GW_CONFIG"
+
+    assert_eq "model 被加上 provider 前缀" "sparring-gw/gpt-test" "$m"
+    assert_file_exists "生成了临时配置文件" "$cfg"
+    if [[ -f "$cfg" ]]; then
+        assert_eq "provider 名" "@ai-sdk/openai-compatible" "$(jq -r '.provider["sparring-gw"].npm' "$cfg")"
+        assert_eq "baseURL 写入" "https://gw.example/v1" "$(jq -r '.provider["sparring-gw"].options.baseURL' "$cfg")"
+        assert_eq "api_key 从 env 解引用后写入" "sk-secret-from-env" "$(jq -r '.provider["sparring-gw"].options.apiKey' "$cfg")"
+        assert_eq "model 登记在 provider 下" "gpt-test" "$(jq -r '.provider["sparring-gw"].models["gpt-test"].name' "$cfg")"
+        # 密钥落盘期间不能让同机器其他用户读到
+        assert_eq "临时配置权限 600" "600" "$(stat -f '%Lp' "$cfg" 2>/dev/null || stat -c '%a' "$cfg")"
+        # 只写 provider 块：OPENCODE_CONFIG 是合并语义，写多了会覆盖用户自己的设置
+        assert_eq "只含 provider 一个顶层键" "provider" "$(jq -r 'keys | join(",")' "$cfg")"
+        rm -f "$cfg"
+    fi
+    rm -f "$CONFIG_FILE_GLOBAL"
+}
+test_gateway_generates_config
+
+echo ""
+echo "=== 对抗式 review 方法论 ==="
+
+test_adversarial_prompt_exists() {
+    source_workflow_funcs
+    local out rc=0
+    out=$(_adversarial_prompt) || rc=$?
+    assert_eq "方法论文件可读" "0" "$rc"
+    assert_contains "含删除行为审计角度" "删除行为审计" "$out"
+    assert_contains "含跨文件追踪角度" "跨文件追踪" "$out"
+    assert_contains "含输出契约" "APPROVE" "$out"
+    assert_contains "契约含 CONCERNS" "CONCERNS" "$out"
+}
+test_adversarial_prompt_exists
+
 # ─── Summary ─────────────────────────────────────────────────
 
 echo ""

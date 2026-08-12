@@ -19,9 +19,10 @@ vim .workflow/plans/20260316-211730-refactor-auth-system/task.md
 # 在 Claude Code 中说：
 # "请为任务 20260316-211730-refactor-auth-system 编写技术方案，保存到相应目录"
 
-# 5. Cursor Agent review 方案
+# 5. reviewer 审方案（自动调用配置的 backend）
 sparring review-proposal 20260316-211730-refactor-auth-system
-# 在 Cursor 中使用 agent review 方案
+# reviewer 自己读 proposal.md，并在项目里核实方案提到的现有代码是否如它所说
+# 结果存到 .workflow/plans/<task-id>/proposal-review-1.md
 
 # 6. 如果需要修改，Claude 更新方案，然后再次 review
 # 重复直到双方满意
@@ -33,7 +34,7 @@ sparring approve-proposal 20260316-211730-refactor-auth-system
 sparring implement 20260316-211730-refactor-auth-system
 # 在 Claude Code 中根据方案实现
 
-# 9. Cursor Agent review 代码
+# 9. reviewer 审代码（自己在项目里跑 git diff 看未提交改动，不用先导出 diff 文件）
 sparring review-code 20260316-211730-refactor-auth-system
 
 # 10. 如果需要修改，继续修改和 review
@@ -68,19 +69,18 @@ sparring create "fix-login-redirect" cursor
 # 编辑任务描述
 vim .workflow/plans/20260316-213000-fix-login-redirect/task.md
 
-# Cursor Agent 编写方案
+# Cursor Agent 编写方案（executor = cursor）
 sparring propose 20260316-213000-fix-login-redirect
 # 在 Cursor 中使用 agent 编写方案
 
-# Claude Code review
+# reviewer 审方案
 sparring review-proposal 20260316-213000-fix-login-redirect
-# 在 Claude Code 中 review
 
 # 批准并实现
 sparring approve-proposal 20260316-213000-fix-login-redirect
 sparring implement 20260316-213000-fix-login-redirect
 
-# Cursor 实现代码，Claude review
+# Cursor 实现代码，reviewer 审代码
 sparring review-code 20260316-213000-fix-login-redirect
 
 # 批准并提交
@@ -90,21 +90,41 @@ git commit -m "fix: correct login redirect behavior"
 git push
 ```
 
-## 示例 3: 添加新功能（协作决定）
+## 示例 3: 添加新功能（选执行者）
 
-当不确定应该由谁执行时：
+执行者（executor）决定"谁来写代码"，跟用哪个 reviewer 后端无关：
 
 ```bash
-# 创建任务时不指定执行者，让工具交互式询问
+# 不指定执行者时默认用 claude
 sparring create "add-user-profile-page"
 
-# 工具会提示选择:
-# 1) claude  - 用于重构、架构设计、原则性讨论
-# 2) cursor  - 用于小改动、单点修改、具体功能
-# 选择 (1/2):
-
-# 根据功能的复杂度和影响范围选择合适的执行者
+# 显式指定：
+sparring create "add-user-profile-page" claude   # 重构、架构设计、原则性讨论
+sparring create "add-user-profile-page" cursor   # 小改动、单点修改、具体功能
 ```
+
+## 示例 4: 不建 task，直接审一段改动
+
+已经写完代码、只想要一次审查时，不用走完整 task 流程：
+
+```bash
+# 审当前分支相对 main 的全部改动
+# reviewer 会建一个只读 worktree 快照，在里面自己跑 git diff、读文件，审完删掉
+sparring review --range origin/main...HEAD --title "用户资料页"
+
+# 只审最近 3 个 commit
+sparring review --range HEAD~3..HEAD
+
+# 审一段结论或方案文本（不建快照）
+echo "打算用 Redis 存 session，理由是……" | sparring review --title "session 存储选型"
+
+# 退出码：0=APPROVE  2=CONCERNS  1=调用错误
+# 拿它当脚本门禁：
+sparring review --range origin/main...HEAD || { echo "review 未通过，别 push"; exit 1; }
+```
+
+> ⚠️ `git diff ... | sparring review` 这种老用法在 3.0 已经会直接报错——改用 `--range`。
+> reviewer 自己进仓库看，所以没有 diff 体量上限，也不需要按文件分片。
 
 ## 常用命令组合
 
@@ -147,8 +167,8 @@ cat .workflow/plans/<task-id>/code-review-1.md
 
 如果代码需要修改：
 - 执行者修改代码
-- 保存新的 diff: `git diff > .workflow/plans/<task-id>/changes-v2.diff`
-- 观察者再次 review
+- 直接重跑 `sparring review-code <task-id>`——reviewer 的工作目录就是项目根，会自己跑 `git diff HEAD` 看最新的未提交改动，不需要先把 diff 导出成文件
+- 每轮结果自动存成 `.workflow/plans/<task-id>/code-review-<N>.md`
 
 ### 3. 保存讨论记录
 
