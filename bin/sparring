@@ -991,6 +991,9 @@ _agent_cmd_claude() {
         # 走 Claude Code 原生 /code-review：审查方法论在引擎里，我们只负责给
         # level + range + 附加指令。level 之后的文本会被当成附加审查指令传下去。
         local slash="/code-review ${_RV_LEVEL} ${_RV_RANGE}"
+        # 输出格式钉死：medium 及以上档位实测偶发在结尾附加过程叙述，
+        # 下游按行解析裁决，叙述会被判成 parse 失败白白降级
+        slash="${slash} 输出要求：最终只输出结果本身——有问题则每行一条「路径:行号 — 问题描述」，无问题则只输出 (none)；不要输出过程叙述、总结、标题或列表符号。"
         [[ -n "$2" ]] && slash="${slash} ${2}"
         AGENT_CMD+=("$slash")
         AGENT_STDIN=""
@@ -1107,13 +1110,16 @@ _normalize_code_review_output() {
     local out="$1" level="$2"
     local trimmed
     trimmed=$(printf '%s' "$out" | tr -d '[:space:]')
-    if [[ "$trimmed" == "(none)" ]]; then
+    # 全文即 (none)，或叙述若干后单独一行 (none)：都算干净
+    if [[ "$trimmed" == "(none)" ]] || printf '%s' "$out" | grep -qE '^[[:space:]]*\(none\)[[:space:]]*$'; then
         printf 'APPROVE\n\nclaude /code-review %s 走完未发现问题。\n' "$level"
         return 0
     fi
     # 只要**有任一行**是 finding 形态就算 CONCERNS：多行 finding 的续行本来就不匹配，
     # 要求整份输出每行都匹配会把正常结果误判成解析失败。
-    if printf '%s' "$out" | grep -qE '^[^[:space:]]+:[0-9]+[[:space:]]'; then
+    # 容忍模型把 finding 行包进列表（"- " / "1. "），以 "路径:行号 —" 为特征锚点
+    # （实测 medium 档偶发在结尾输出过程叙述，锚点比行首匹配稳）。
+    if printf '%s' "$out" | grep -qE '^[[:space:]]*([-*•]|[0-9]+\.)?[[:space:]]*[^[:space:]]+:[0-9]+ —'; then
         printf 'CONCERNS\n\n%s\n' "$out"
         return 0
     fi
