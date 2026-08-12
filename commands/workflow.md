@@ -29,15 +29,10 @@ Default executor is **claude** (you). The reviewer is whichever backend `review.
 
 ### How to call the reviewer for ad-hoc conclusions:
 ```bash
-response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-high "你正在 review 一个技术建议。
+response=$(printf '%s' "上下文: <context>
 
-上下文: <context>
-
-建议: <the conclusion you want to give>
-
-请 review 并回复:
-- APPROVE: 如果建议合理
-- CONCERNS: <编号列表> 如果有问题")
+建议: <the conclusion you want to give>" | sparring review --title "结论审查")
+# exit 0 = APPROVE / 2 = CONCERNS / 1 = 调用错误；走配置的 review backend（claude 或 opencode）
 ```
 
 If the reviewer raises CONCERNS, reconsider your conclusion before presenting to the user. You may adjust it, or present both perspectives and let the user decide.
@@ -124,7 +119,7 @@ sparring review-code <task-id>        # reviewer runs git diff itself in the pro
 
 **Option 2: Call agent directly (for ad-hoc conclusion review):**
 ```bash
-response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-high "<review prompt>")
+response=$(printf '%s' "<review prompt>" | sparring review --title "<主题>")
 ```
 
 **Important notes on calling agent:**

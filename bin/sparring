@@ -994,12 +994,13 @@ _agent_cmd_claude() {
         # 输出格式钉死：medium 及以上档位实测偶发在结尾附加过程叙述，
         # 下游按行解析裁决，叙述会被判成 parse 失败白白降级
         slash="${slash} 输出要求：最终只输出结果本身——有问题则每行一条「路径:行号 — 问题描述」，无问题则只输出 (none)；不要输出过程叙述、总结、标题或列表符号。"
-        [[ -n "$2" ]] && slash="${slash} ${2}"
+        [[ -n "${2:-}" ]] && slash="${slash} ${2}"
         AGENT_CMD+=("$slash")
         AGENT_STDIN=""
     else
         # 纯文本审查（结论/方案）不适用 /code-review——它审的是代码改动。
-        AGENT_STDIN="$2"
+        # ${2:-}：verify 只测连通性、不传 payload，set -u 下裸 $2 会直接崩
+        AGENT_STDIN="${2:-}"
     fi
     AGENT_CMD+=(--output-format text)
     [[ -n "$model" ]] && AGENT_CMD+=(--model "$model")
@@ -1019,7 +1020,8 @@ _agent_cmd_opencode() {
     # --agent plan 还有一个必要作用：压过用户全局配置里的 default_agent。
     AGENT_CMD=(opencode run --agent plan)
     [[ -n "$model" ]] && AGENT_CMD+=(-m "$model")
-    AGENT_STDIN="$2"
+    # ${2:-}：verify 只测连通性、不传 payload，set -u 下裸 $2 会直接崩
+    AGENT_STDIN="${2:-}"
 }
 
 # ─── opencode 认证注入 ───────────────────────────────────────
@@ -1115,19 +1117,21 @@ _verdict_of() {
 # 认不出来的一律返回失败（reason=parse），绝不默认放行。
 _normalize_code_review_output() {
     local out="$1" level="$2"
-    local trimmed
-    trimmed=$(printf '%s' "$out" | tr -d '[:space:]')
-    # 全文即 (none)，或叙述若干后单独一行 (none)：都算干净
-    if [[ "$trimmed" == "(none)" ]] || printf '%s' "$out" | grep -qE '^[[:space:]]*\(none\)[[:space:]]*$'; then
-        printf 'APPROVE\n\nclaude /code-review %s 走完未发现问题。\n' "$level"
-        return 0
-    fi
+    # findings 判定必须在 (none) 判定**之前**：两者同现时（模型先列问题
+    # 再补一行 (none) 之类的失态输出）宁可误报 CONCERNS，绝不 fail-open。
     # 只要**有任一行**是 finding 形态就算 CONCERNS：多行 finding 的续行本来就不匹配，
     # 要求整份输出每行都匹配会把正常结果误判成解析失败。
     # 容忍模型把 finding 行包进列表（"- " / "1. "），以 "路径:行号 —" 为特征锚点
     # （实测 medium 档偶发在结尾输出过程叙述，锚点比行首匹配稳）。
     if printf '%s' "$out" | grep -qE '^[[:space:]]*([-*•]|[0-9]+\.)?[[:space:]]*[^[:space:]]+:[0-9]+ —'; then
         printf 'CONCERNS\n\n%s\n' "$out"
+        return 0
+    fi
+    # 全文即 (none)，或叙述若干后单独一行 (none)：都算干净
+    local trimmed
+    trimmed=$(printf '%s' "$out" | tr -d '[:space:]')
+    if [[ "$trimmed" == "(none)" ]] || printf '%s' "$out" | grep -qE '^[[:space:]]*\(none\)[[:space:]]*$'; then
+        printf 'APPROVE\n\nclaude /code-review %s 走完未发现问题。\n' "$level"
         return 0
     fi
     return 1
@@ -1172,6 +1176,8 @@ _call_backend() {
         local methodology
         if ! methodology=$(_adversarial_prompt); then
             [[ -n "$ephemeral_cwd" ]] && rm -rf "$ephemeral_cwd"
+            # 网关临时配置含明文 apiKey，这个早退分支在 _cleanup 定义之前，必须单独删
+            [[ -n "$gw_config" ]] && rm -f "$gw_config"
             _error_reason_record crash
             return 1
         fi
@@ -1646,7 +1652,7 @@ review_adhoc() {
 
 进程管理（每次 review 只有三种结局，不存在静默挂死）:
   APPROVE / CONCERNS / 带原因的 ERROR（timeout|crash|empty|parse）
-  超时（config review.timeout，默认 600s）杀掉整个进程组，不留孤儿进程；
+  超时（config review.timeout，默认 1800s）杀掉整个进程组，不留孤儿进程；
   运行期间每 15s 往 stderr 打一行心跳。
 
 执行日志（排查超时/降级用）:
@@ -2680,10 +2686,10 @@ show_status() {
 
 # ─── Config 子命令 ──────────────────────────────────────────
 
-# 返回给用户看的配置视图。两个后端都靠各自 CLI 的登录态，
-# sparring 自己不存任何 key，所以这里没有需要打掩码的字段。
+# 返回给用户看的配置视图。opencode 网关注入的 api_key 存在 sparring 配置里，
+# 展示时必须脱敏（origin/main 时代对 glm.api_key 同理，重构时一度丢失）。
 _config_masked_view() {
-    _config_merged
+    _config_merged | jq 'if (.opencode.api_key // "") != "" then .opencode.api_key = "••••••（已配置）" else . end'
 }
 
 config_show() {
@@ -3181,7 +3187,7 @@ ${YELLOW}环境变量（可覆盖 config.json 任意字段）:${NC}
     WORKFLOW_REVIEW_BACKEND_FALLBACK → review.fallback
     以及所有 WORKFLOW_* 形式的新 schema 变量
 
-  ${DIM}超时: reviewer 是自己跑 git/读文件的 agent，耗时以分钟计，默认单次 600s。${NC}
+  ${DIM}超时: reviewer 是自己跑 git/读文件的 agent，耗时以分钟计，默认单次 1800s。${NC}
   ${DIM}⚠ 最坏总等待 ≈ review.timeout × (retries+1)。想快速失败可设 review.retries=0。${NC}
 
 ${YELLOW}Issue 相关环境变量:${NC}

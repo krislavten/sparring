@@ -252,7 +252,7 @@ sparring config get review.backend  # single value
   "review": {
     "backend": "claude",
     "fallback": "opencode",
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1,
     "log_retention_days": 7
   },
@@ -270,7 +270,7 @@ sparring config get review.backend  # single value
 ```json
 {
   "review": {
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1
   }
 }
@@ -283,12 +283,12 @@ sparring config get review.backend  # single value
 ```bash
 export SPARRING_REVIEW_BACKEND=opencode  # → review.backend
 export SPARRING_REVIEW_FALLBACK=claude   # → review.fallback
-export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout (temporary bump; default is already 600)
+export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout (temporary bump; default is already 1800)
 ```
 
 > 💡 **There are no API keys in the config.** Both backends use the account their own CLI is logged into (`claude login` / `opencode auth login`); Sparring only picks the backend and the model, so a new machine just needs each CLI logged in once.
 
-> ⏱️ **Timeouts are measured in minutes**: the reviewer is an agent running git and reading files, so a single review takes minutes — hence `review.timeout` defaults to 600s. The pre-3.0 "scale the timeout with the size of the content" behavior is gone: the diff no longer enters the prompt, so there's nothing to scale against. It's a flat value now.
+> ⏱️ **Timeouts are measured in minutes**: the reviewer is an agent running git and reading files, so a single review takes minutes — hence `review.timeout` defaults to 1800s. The pre-3.0 "scale the timeout with the size of the content" behavior is gone: the diff no longer enters the prompt, so there's nothing to scale against. It's a flat value now.
 >
 > ⚠️ **Retries multiply the worst-case wait linearly**: each retry reuses the full per-call timeout — it's never shrunk. With the default `review.retries=1` (2 attempts total), a single `sparring review` can take up to **1200s (20 min)** before failing. This is intentional — retries exist to absorb transient network errors. Set `review.retries=0` if you'd rather fail fast.
 
@@ -298,7 +298,7 @@ export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout (temporary bump; d
 |---|---|---|
 | `review.backend` | `claude` | Primary backend; only `claude` or `opencode` |
 | `review.fallback` | `opencode` | Fallback backend; `null` disables degradation |
-| `review.timeout` | `600` | Per-call timeout in seconds (flat — no adaptive scaling) |
+| `review.timeout` | `1800` | Per-call timeout in seconds (flat — no adaptive scaling) |
 | `review.retries` | `1` | Retries after failure (total attempts = retries + 1) |
 | `review.log_retention_days` | `7` | Days to keep the execution log; `0` disables logging entirely |
 | `claude.model` | `null` | Empty = whatever Claude Code defaults to |

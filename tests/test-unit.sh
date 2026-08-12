@@ -1266,17 +1266,22 @@ test_verify_returns_nonzero_on_failure() {
     mkdir -p "$shim"
     printf '#!/bin/bash\necho "boom" >&2\nexit 1\n' > "$shim/claude"
     chmod +x "$shim/claude"
-    PATH="$shim:$PATH" \
+    local vout=""
+    vout=$(PATH="$shim:$PATH" \
     SPARRING_REVIEW_BACKEND=claude \
     SPARRING_REVIEW_FALLBACK=claude \
     SPARRING_REVIEW_TIMEOUT=5 \
-    bash "$WORKFLOW" verify >/dev/null 2>&1 || rc=$?
-    # 预期非 0（连通性必然失败）
+    bash "$WORKFLOW" verify 2>&1) || rc=$?
+    # 预期非 0（连通性必然失败），且必须是受控失败而非 set -u 崩溃——
+    # 崩溃和受控失败退出码相同，只断言 rc 会把 unbound variable 回归放绿
     if [[ $rc -eq 0 ]]; then
         echo "  ✗ verify 主 backend 失败时 exit=0（应该 !=0）"
         ((FAIL++))
+    elif printf '%s' "$vout" | grep -qiE "unbound variable|parameter not set"; then
+        echo "  ✗ verify 崩溃（unbound variable）而非受控失败"
+        ((FAIL++))
     else
-        echo "  ✓ verify 主 backend 失败时 exit=${rc}（非 0）"
+        echo "  ✓ verify 主 backend 失败时 exit=${rc}（非 0，受控失败）"
         ((PASS++))
     fi
 }
@@ -2022,6 +2027,17 @@ test_code_review_garbage_is_parse_error() {
     assert_eq "报错文本 → 解析失败" "1" "$rc"
 }
 test_code_review_garbage_is_parse_error
+
+test_code_review_findings_beat_none() {
+    source_workflow_funcs
+    # fail-open 回归（自审 round-2 finding）：findings 与单独一行 (none) 同现时，
+    # findings 判定必须赢——绝不能被 (none) 抢先翻译成 APPROVE
+    local out
+    out=$(_normalize_code_review_output "src/a.js:12 — 空指针
+(none)" low)
+    assert_eq "findings 与 (none) 同现 → CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
+}
+test_code_review_findings_beat_none
 
 echo ""
 echo "=== 失败原因回传 ==="

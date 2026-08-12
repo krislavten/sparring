@@ -10,7 +10,7 @@
 - **不再接收 diff 文本**：stdin 里出现 `diff --git ` / `--- a/` 打头的行直接报错并提示改用 `--range`，不做静默兼容。纯文本审查（审结论/方案）保留原样。
 - `--range` 模式不读 stdin。非交互环境里 stdin 常是不会关闭的管道，读它会永久阻塞。
 - **后端从 4 个收敛到 2 个**：`claude`（`claude -p`，放行 Bash + Read/Grep/Glob，禁 Edit/Write/NotebookEdit/Task/WebFetch/WebSearch）和 `opencode`（`opencode run --agent plan`）。cursor / codex / glm 三个后端连同 `agents/cursor.md` 一起删除。
-- **默认值**：`review.backend` glm → `claude`；`review.fallback` null → `opencode`；`review.timeout` 120 → `600`。
+- **默认值**：`review.backend` glm → `claude`；`review.fallback` null → `opencode`；`review.timeout` 120 → `1800`。
 - **删除输入体量门禁**：`--max-diff-lines`、`--exclude`、`--no-default-excludes`、内置 denylist、400 行上限、分片建议全部移除。reviewer 自己进仓库看，prompt 里不再有 diff，也就没有体量问题。
 - **删除自适应超时**：不再按送审内容大小加时，改回扁平的 `review.timeout`。
 - **配置里不再有任何 API key**：两个后端都用各自 CLI 已登录的账号。`glm.*`、`claude.base_url` / `api_key` / `config_dir` / `mode` 全部删除。现在的 schema 只剩 `review.{backend,fallback,timeout,retries,log_retention_days}` + `claude.{model,use_proxy,extra_args}` + `opencode.{model,use_proxy,extra_args}`。

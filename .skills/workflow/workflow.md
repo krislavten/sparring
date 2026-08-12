@@ -83,7 +83,7 @@ When the user invokes `/sparring:workflow <task-description> <executor:claude|cu
    ```
    while not approved and rounds < 5:
      reviewer: call `sparring review-proposal <task-id>`
-       (internally runs: agent --print --trust --model $WORKFLOW_AGENT_MODEL)
+       (internally runs the configured review backend: claude /code-review or opencode)
      parse reviewer response
      if APPROVE:
        break
@@ -122,7 +122,7 @@ When the user invokes `/sparring:workflow <task-description> <executor:claude|cu
    executor: implement code per proposal
    while not approved and rounds < 5:
      reviewer: call `sparring review-code <task-id>`
-       (internally runs: agent --print --trust --model $WORKFLOW_AGENT_MODEL)
+       (internally runs the configured review backend: claude /code-review or opencode)
      if APPROVE:
        break
      else:
@@ -200,7 +200,7 @@ sparring review-code <task-id>        # auto-calls agent
 
 **Option 2: Call agent directly:**
 ```bash
-response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-high "你正在 review 一份技术方案。
+response=$(printf '%s' "你正在 review 一份技术方案。
 
 任务: <task-name>
 
@@ -211,12 +211,11 @@ response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-
 - APPROVE: 如果方案合理可行
 - CONCERNS: <编号列表> 如果有问题
 
-重点: 架构合理性、可行性、边界情况、安全性。请用中文简洁回复。")
+重点: 架构合理性、可行性、边界情况、安全性。请用中文简洁回复。" | sparring review --title "方案审查")
 ```
 
-**Important notes on calling agent:**
-- Always unset `HTTP_PROXY` and `HTTPS_PROXY` to avoid proxy issues
-- Use `--trust` for non-interactive (headless) mode
+**Important notes on calling the reviewer:**
+- `sparring review` 退出码: 0 = APPROVE / 2 = CONCERNS / 1 = 调用错误
 - Backend and model are configured in `~/.config/sparring/config.json` (`review.backend` defaults to `claude`)
 - Override model via env var: `export WORKFLOW_AGENT_MODEL=sonnet-4`
 

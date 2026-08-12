@@ -49,7 +49,7 @@ Commit!
    sparring review-proposal <task-id>
 
    # Option B: Call agent directly
-   response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-high "Review this proposal: ...")
+   response=$(printf '%s' "Review this proposal: ..." | sparring review --title "proposal")
    if echo "$response" | grep -qi "APPROVE"; then
      # approved
    else
@@ -68,7 +68,7 @@ Commit!
    sparring review-code <task-id>
 
    # Option B: Call agent directly
-   response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-high "Review this code: $(git diff)")
+   response=$(sparring review --range origin/main...HEAD)   # reviewer 自己进快照跑 git diff
    if echo "$response" | grep -qi "APPROVE"; then
      # approved
    else
@@ -100,7 +100,7 @@ Commit!
 
 ### If YOU are the Reviewer
 
-- Wait to be called by executor via `agent --print`
+- Wait to be called by executor via `sparring review`
 - Review thoroughly
 - Respond with `APPROVE` or `CONCERNS: <list>`
 - Don't involve user

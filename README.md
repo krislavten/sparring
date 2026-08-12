@@ -250,7 +250,7 @@ sparring config get review.backend  # 取单值
   "review": {
     "backend": "claude",
     "fallback": "opencode",
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1,
     "log_retention_days": 7
   },
@@ -268,7 +268,7 @@ sparring config get review.backend  # 取单值
 ```json
 {
   "review": {
-    "timeout": 600,
+    "timeout": 1800,
     "retries": 1
   }
 }
@@ -281,12 +281,12 @@ sparring config get review.backend  # 取单值
 ```bash
 export SPARRING_REVIEW_BACKEND=opencode  # → review.backend
 export SPARRING_REVIEW_FALLBACK=claude   # → review.fallback
-export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout（临时调大；默认已是 600）
+export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout（临时调大；默认已是 1800）
 ```
 
 > 💡 **配置里没有任何 API key。** 两个后端都跑对应 CLI 已登录的账号（`claude login` / `opencode auth login`），sparring 只负责选后端和模型，新机器只要各自登录一次 CLI。
 
-> ⏱️ **超时以分钟计**：reviewer 是个自己跑 git、读文件的 agent，一次审查耗时以分钟计，所以 `review.timeout` 默认 600s。3.0 之前的"按送审内容大小自适应加时"已删除——diff 不再进 prompt，也就没有按大小加时这回事，现在是扁平值。
+> ⏱️ **超时以分钟计**：reviewer 是个自己跑 git、读文件的 agent，一次审查耗时以分钟计，所以 `review.timeout` 默认 1800s。3.0 之前的"按送审内容大小自适应加时"已删除——diff 不再进 prompt，也就没有按大小加时这回事，现在是扁平值。
 >
 > ⚠️ **重试会线性放大最坏等待时间**：失败重试时每次都会用满同一个单次超时，不会缩水。默认 `review.retries=1`（共尝试 2 次），最坏情况下一次 `sparring review` 可能等待到 **1200s（20 分钟）** 才报错。这是有意为之——重试是为了应对网络抖动/瞬时错误。如果不想等这么久，设 `review.retries=0` 关闭重试。
 
@@ -296,7 +296,7 @@ export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout（临时调大；�
 |---|---|---|
 | `review.backend` | `claude` | 主后端，只能是 `claude` 或 `opencode` |
 | `review.fallback` | `opencode` | 备后端；`null` = 关掉降级 |
-| `review.timeout` | `600` | 单次调用超时秒数（扁平值，不再自适应加时） |
+| `review.timeout` | `1800` | 单次调用超时秒数（扁平值，不再自适应加时） |
 | `review.retries` | `1` | 失败后重试次数（共尝试 retries+1 次） |
 | `review.log_retention_days` | `7` | 执行日志保留天数；`0` = 完全不写日志 |
 | `claude.model` | `null` | 留空 = 用 Claude Code 自己的默认模型 |
