@@ -1308,7 +1308,9 @@ test_resolve_script_dir_via_symlink() {
         }
         _resolve_script_dir
     ' "$fake_bin/sparring")
-    assert_eq "通过软链 _resolve_script_dir 回到 repo 根" "$PROJECT_DIR" "$resolved"
+    # 两侧都取物理路径：仓库位于含符号链接的路径时（macOS /tmp、/var/folders），
+    # cd -P 的结果和逻辑路径 $PROJECT_DIR 字面不同但指向同一目录
+    assert_eq "通过软链 _resolve_script_dir 回到 repo 根" "$(cd -P "$PROJECT_DIR" && pwd)" "$resolved"
 }
 test_resolve_script_dir_via_symlink
 
@@ -2038,6 +2040,19 @@ test_code_review_findings_beat_none() {
     assert_eq "findings 与 (none) 同现 → CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
 }
 test_code_review_findings_beat_none
+
+test_code_review_separator_variants() {
+    source_workflow_funcs
+    # round-3 finding：只认全角破折号会让模型换个连字符就整份审查作废重跑
+    local out
+    out=$(_normalize_code_review_output "src/a.js:12 - ASCII 连字符" low)
+    assert_eq "ASCII 连字符分隔 → CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
+    out=$(_normalize_code_review_output "src/a.js:12: 冒号分隔" low)
+    assert_eq "冒号分隔 → CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
+    out=$(_normalize_code_review_output "src/a.js:12 – en-dash 分隔" low)
+    assert_eq "en-dash 分隔 → CONCERNS" "CONCERNS" "$(echo "$out" | head -1)"
+}
+test_code_review_separator_variants
 
 echo ""
 echo "=== 失败原因回传 ==="

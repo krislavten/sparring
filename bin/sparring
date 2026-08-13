@@ -1121,9 +1121,10 @@ _normalize_code_review_output() {
     # 再补一行 (none) 之类的失态输出）宁可误报 CONCERNS，绝不 fail-open。
     # 只要**有任一行**是 finding 形态就算 CONCERNS：多行 finding 的续行本来就不匹配，
     # 要求整份输出每行都匹配会把正常结果误判成解析失败。
-    # 容忍模型把 finding 行包进列表（"- " / "1. "），以 "路径:行号 —" 为特征锚点
+    # 容忍模型把 finding 行包进列表（"- " / "1. "），以 "路径:行号 <分隔符>" 为特征锚点
     # （实测 medium 档偶发在结尾输出过程叙述，锚点比行首匹配稳）。
-    if printf '%s' "$out" | grep -qE '^[[:space:]]*([-*•]|[0-9]+\.)?[[:space:]]*[^[:space:]]+:[0-9]+ —'; then
+    # 分隔符容忍全角/半角破折号和冒号——模型换个连字符不该让整份审查作废重跑。
+    if printf '%s' "$out" | grep -qE '^[[:space:]]*([-*•]|[0-9]+\.)?[[:space:]]*[^[:space:]]+:[0-9]+([[:space:]]+[—–-]|:)[[:space:]]'; then
         printf 'CONCERNS\n\n%s\n' "$out"
         return 0
     fi
@@ -1215,6 +1216,11 @@ _call_backend() {
     local _cleanup="rm -f \"$prompt_file\" \"$output_file\" \"$log_file\""
     [[ -n "$ephemeral_cwd" ]] && _cleanup="$_cleanup; rm -rf \"$ephemeral_cwd\""
     [[ -n "$gw_config" ]] && _cleanup="$_cleanup; rm -f \"$gw_config\""
+    # 中场退场（Ctrl-C / kill）也要清临时文件——网关配置含明文 apiKey。
+    # 只 trap 信号，不碰 RETURN/EXIT（本脚本已知坑，见 line ~309）。
+    # 本函数在命令替换子 shell 里跑，trap 作用域随子 shell 结束；清理命令
+    # 在设 trap 时已展开成字面路径，函数正常返回后的残留 trap 无副作用。
+    trap "_heartbeat_stop 2>/dev/null || true; ${_cleanup}; exit 130" INT TERM HUP
 
     local label timeout_s max_attempts
     label=$(reviewer_label_for_backend "$backend")
@@ -2893,6 +2899,15 @@ _verify_agent_backend() {
     local model use_proxy
     model=$(_config_get "${backend}.model")
     use_proxy=$(_config_get "${backend}.use_proxy")
+
+    # opencode 走网关注入时，verify 必须与真实 review 同一条路径——
+    # 否则网关用户会看到假的「连接失败」（review 正常、verify 报错还误导重新登录）
+    local gw_config=""
+    if [[ "$backend" == "opencode" ]]; then
+        _opencode_gateway_setup
+        model="$_OPENCODE_GW_MODEL"
+        gw_config="$_OPENCODE_GW_CONFIG"
+    fi
     echo -e "  模型: ${model:-default(CLI 自己的默认)}"
     echo -e "  代理: $([[ "$use_proxy" == "true" ]] && echo "保留" || echo "已清空")"
 
@@ -2912,9 +2927,11 @@ _verify_agent_backend() {
     err_file=$(mktemp "${TMPDIR:-/tmp}/sparring-verify-log.XXXXXX")
     run_cwd=$(mktemp -d "${TMPDIR:-/tmp}/sparring-verify-cwd.XXXXXX")
     local _vclean="rm -f \"$err_file\"; rm -rf \"$run_cwd\""
+    [[ -n "$gw_config" ]] && _vclean="$_vclean; rm -f \"$gw_config\""
 
     local -a envs=()
     [[ "$use_proxy" != "true" ]] && envs+=("HTTP_PROXY=" "HTTPS_PROXY=")
+    [[ -n "$gw_config" ]] && envs+=("OPENCODE_CONFIG=$gw_config")
 
     if out=$( cd "$run_cwd" && _timeout_cmd 90 env ${envs[@]+"${envs[@]}"} "${AGENT_CMD[@]}" \
                 <<< "Reply with only: OK" 2>"$err_file" ); then
