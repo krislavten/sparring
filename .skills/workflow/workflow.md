@@ -1,5 +1,5 @@
 ---
-description: Dual AI collaborative workflow - Execute tasks with automatic peer review between Claude and Cursor Agent
+description: Dual AI collaborative workflow - Execute tasks with automatic peer review by a second agent
 trigger: When user says "/sparring:workflow" or "/sparring:yolo"
 mode: command
 targetAgents:
@@ -83,7 +83,7 @@ When the user invokes `/sparring:workflow <task-description> <executor:claude|cu
    ```
    while not approved and rounds < 5:
      reviewer: call `sparring review-proposal <task-id>`
-       (internally runs: agent --print --trust --model $WORKFLOW_AGENT_MODEL)
+       (internally runs the configured review backend: claude /code-review or opencode)
      parse reviewer response
      if APPROVE:
        break
@@ -122,7 +122,7 @@ When the user invokes `/sparring:workflow <task-description> <executor:claude|cu
    executor: implement code per proposal
    while not approved and rounds < 5:
      reviewer: call `sparring review-code <task-id>`
-       (internally runs: agent --print --trust --model $WORKFLOW_AGENT_MODEL)
+       (internally runs the configured review backend: claude /code-review or opencode)
      if APPROVE:
        break
      else:
@@ -185,7 +185,7 @@ All intermediate steps automated, only final commit requires user.
 4. **Auto-iterate on code**
 5. **Present final result** to user for commit
 
-### When YOU are Reviewer (for Cursor's work)
+### When YOU are Reviewer (for the other agent's work)
 - **Use the `sparring` CLI** or call agent directly
 - **Parse the response** and extract concerns/approvals
 - **Don't proceed** until concerns are addressed
@@ -200,7 +200,7 @@ sparring review-code <task-id>        # auto-calls agent
 
 **Option 2: Call agent directly:**
 ```bash
-response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-high "你正在 review 一份技术方案。
+response=$(printf '%s' "你正在 review 一份技术方案。
 
 任务: <task-name>
 
@@ -211,20 +211,19 @@ response=$(HTTP_PROXY= HTTPS_PROXY= agent --print --trust --model gpt-5.5-extra-
 - APPROVE: 如果方案合理可行
 - CONCERNS: <编号列表> 如果有问题
 
-重点: 架构合理性、可行性、边界情况、安全性。请用中文简洁回复。")
+重点: 架构合理性、可行性、边界情况、安全性。请用中文简洁回复。" | sparring review --title "方案审查")
 ```
 
-**Important notes on calling agent:**
-- Always unset `HTTP_PROXY` and `HTTPS_PROXY` to avoid proxy issues
-- Use `--trust` for non-interactive (headless) mode
-- Model and system prompt are configured in `agents/cursor.md` (default: `gpt-5.5-extra-high`)
+**Important notes on calling the reviewer:**
+- `sparring review` 退出码: 0 = APPROVE / 2 = CONCERNS / 1 = 调用错误
+- Backend and model are configured in `~/.config/sparring/config.json` (`review.backend` defaults to `claude`)
 - Override model via env var: `export WORKFLOW_AGENT_MODEL=sonnet-4`
 
 ### Issue Sync Protocol
 
 When a task has an associated `issue_number` in `meta.json`, **sync key actions to the Issue as comments with identity markers**:
 
-- The `sparring` CLI auto-syncs review results (Cursor Agent reviews)
+- The `sparring` CLI auto-syncs review results (reviewer backend reviews)
 - **You (Claude) must manually sync your own actions** using:
   ```bash
   sparring issue-comment <number> "🧠 **[Claude Code — <Phase>]**
@@ -234,15 +233,15 @@ When a task has an associated `issue_number` in `meta.json`, **sync key actions 
 
 **What to sync to Issue:**
 1. **Proposal draft** — post summary when you write the proposal
-2. **Your responses to reviewer feedback** — when you address Cursor's concerns
+2. **Your responses to reviewer feedback** — when you address the reviewer's concerns
 3. **Implementation summary** — when code is done
 4. **Status changes** — approved, blocked, etc.
 
 **Identity markers (so humans can tell who said what):**
 - `🧠 **[Claude Code — Proposal]**` — Claude's proposal
 - `🧠 **[Claude Code — Implementation]**` — Claude's code summary
-- `🤖 **[Cursor Agent — Proposal Review]**` — Cursor's review (auto-synced by CLI)
-- `🤖 **[Cursor Agent — Code Review]**` — Cursor's review (auto-synced by CLI)
+- `🧠 **[<reviewer> — Proposal Review]**` — reviewer output (auto-synced by CLI)
+- `🧠 **[<reviewer> — Code Review]**` — reviewer output (auto-synced by CLI)
 - `🔧 **[Workflow — Status]**` — status transitions (auto-synced by CLI)
 
 **When there is NO `issue_number`**: skip all sync, work purely locally.
@@ -276,7 +275,7 @@ User: "Let's go with A"
 
 Claude: "Perfect. Writing formal proposal..."
 [writes proposal.md]
-[auto-calls Cursor Agent for review]
+[auto-calls the reviewer backend]
 [iterates based on feedback]
 
 Claude: "✅ Proposal ready:
@@ -290,7 +289,7 @@ Approve to start coding? (yes/no)"
 User: "yes"
 
 Claude: [implements code]
-[auto-reviews with Cursor]
+[auto-reviews with the reviewer backend]
 [fixes issues]
 
 Claude: "✅ Implementation complete:

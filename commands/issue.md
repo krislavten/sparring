@@ -5,7 +5,7 @@ argument-hint: <project-url> [issue-number]
 
 # GitHub Issue-Driven Dual AI Workflow
 
-You are the **Workflow Orchestrator** that consumes GitHub Issues as a task queue. Claude is the Executor, Cursor Agent is the Reviewer. Communication with the user happens via **Issue Comments**.
+You are the **Workflow Orchestrator** that consumes GitHub Issues as a task queue. Claude is the Executor, the configured review backend is the Reviewer. Communication with the user happens via **Issue Comments**.
 
 ## Project Context
 
@@ -32,8 +32,8 @@ GitHub Issue (Planning + claude-ok label)
   ↓  poll / manual trigger
 Claude claims issue → status: In progress
   ↓
-Normal: Discuss direction via issue comments → draft proposal → Cursor review (≤5 rounds) → implement → Cursor review code (≤5 rounds) → PR
-YOLO:   Draft proposal autonomously → Cursor review (≤5 rounds) → implement → Cursor review code (≤5 rounds) → PR
+Normal: Discuss direction via issue comments → draft proposal → reviewer review (≤5 rounds) → implement → reviewer review code (≤5 rounds) → PR
+YOLO:   Draft proposal autonomously → reviewer review (≤5 rounds) → implement → reviewer review code (≤5 rounds) → PR
   ↓
 PR created → status: Reviewing
 ```
@@ -88,7 +88,7 @@ gh issue view <number> --repo <repo> --json body,title,comments
 1. Write complete technical proposal to `.workflow/plans/<task-id>/proposal.md`
 2. Post proposal summary as issue comment
 
-### Step 4: Cursor Agent Reviews Proposal (Both Modes, ≤5 rounds)
+### Step 4: Reviewer Reviews Proposal (Both Modes, ≤5 rounds)
 
 ```
 for round in 1..5:
@@ -106,7 +106,7 @@ if 5 rounds without approval: escalate to user
 2. Implement code per approved proposal
 3. Write tests alongside implementation
 
-### Step 6: Cursor Agent Reviews Code (Both Modes, ≤5 rounds)
+### Step 6: Reviewer Reviews Code (Both Modes, ≤5 rounds)
 
 ```
 for round in 1..5:
@@ -136,8 +136,8 @@ Since all comments are posted via `gh` under the same GitHub account, **prefix e
 
 - `🧠 **[Claude Code — Proposal]**` — Claude's proposal or direction discussion
 - `🧠 **[Claude Code — Implementation]**` — Claude's implementation summary
-- `🤖 **[Cursor Agent — Proposal Review #N]**` — Cursor's proposal review (auto-synced by CLI)
-- `🤖 **[Cursor Agent — Code Review #N]**` — Cursor's code review (auto-synced by CLI)
+- `🧠 **[<reviewer> — Proposal Review #N]**` — reviewer proposal review (auto-synced by CLI)
+- `🧠 **[<reviewer> — Code Review #N]**` — reviewer code review (auto-synced by CLI)
 - `🔧 **[Workflow — Status]**` — automated status transitions
 
 **Claude must always use the `🧠` prefix** when posting comments:
@@ -170,7 +170,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
 ## Error Handling
 
 - **gh CLI fails**: Inform user locally, retry once, then pause
-- **Cursor Agent unreachable**: Degrade to manual review, continue
+- **Reviewer backend unreachable**: falls back to the other backend; both down → degrade to manual review, continue
 - **5 review rounds without approval**: Post to issue, escalate to user
 - **User doesn't reply in 10 min**: Notify locally, keep polling
 - **Merge conflict**: Inform user, attempt rebase, ask for help if fails

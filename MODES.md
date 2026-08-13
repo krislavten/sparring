@@ -77,9 +77,9 @@ User: 方案A吧，我们可以通过短过期时间 + refresh token 来解决�
 
 Claude: 好的！我来写详细方案...
 [写方案]
-[自动调用 Cursor Agent review，讨论3轮优化]
+[自动调用 reviewer review，讨论3轮优化]
 
-Claude: ✅ 方案已完成并经过 Cursor Agent 审核！
+Claude: ✅ 方案已完成并经过 reviewer 审核！
 
 核心设计：
 - Access token 15分钟过期
@@ -92,7 +92,7 @@ Claude: ✅ 方案已完成并经过 Cursor Agent 审核！
 - 需要客户端处理refresh逻辑
 
 📄 完整方案：.workflow/plans/xxx/proposal-final.md
-📝 Cursor 审核意见：.workflow/plans/xxx/review-3.md
+📝 Reviewer 审核意见：.workflow/plans/xxx/proposal-review-3.md
 
 确认开始编码吗？(yes/no)
 
@@ -100,9 +100,9 @@ User: yes
 
 Claude: 开始实现...
 [写代码]
-[自动调用 Cursor review code，修复2轮issue]
+[自动调用 reviewer 审代码，修复2轮issue]
 
-Claude: ✅ 实现完成并经过 Cursor Agent 代码审核！
+Claude: ✅ 实现完成并经过 reviewer 代码审核！
 
 修改文件：
 - src/auth/jwt.service.ts (新建，JWT核心逻辑)
@@ -116,7 +116,7 @@ Claude: ✅ 实现完成并经过 Cursor Agent 代码审核！
 - ✅ 压测达标 QPS 12000
 
 📊 完整 diff：.workflow/plans/xxx/final.diff
-📝 Cursor 代码审核：.workflow/plans/xxx/code-review-2.md
+📝 Reviewer 代码审核：.workflow/plans/xxx/code-review-2.md
 
 确认提交吗？(yes/no)
 
@@ -168,15 +168,15 @@ graph TD
 ```
 User: /sparring:yolo 修复用户头像上传失败的bug cursor
 
-[Cursor Agent 完全自主工作]
+[执行者 Cursor Agent 完全自主工作]
 [分析问题]
 [写方案]
-[与 Claude 讨论方案，3轮]
+[与 reviewer 讨论方案，3轮]
 [实现代码]
-[与 Claude code review，2轮]
+[reviewer 审代码，2轮]
 [运行测试]
 
-Cursor: ✅ Bug 已修复并经过 Claude 审核！
+Cursor: ✅ Bug 已修复并经过 reviewer 审核！
 
 问题根因：
 - 文件上传中间件只允许 jpg/png，不支持 webp
@@ -196,8 +196,8 @@ Cursor: ✅ Bug 已修复并经过 Claude 审核！
 - ✅ 手动上传 webp 成功
 
 审核轮次：
-- 方案审核：3轮（Claude 提出了边界情况处理建议）
-- 代码审核：2轮（Claude 建议添加文件类型验证）
+- 方案审核：3轮（reviewer 提出了边界情况处理建议）
+- 代码审核：2轮（reviewer 建议添加文件类型验证）
 
 📄 完整记录：.workflow/plans/xxx/
 📊 Diff：.workflow/plans/xxx/final.diff
@@ -237,6 +237,7 @@ Cursor: [提交] 完成！🎉
 
 两种模式都保证：
 - ✅ **双 AI 互审** - 执行者和观察者必须都同意
+- ✅ **reviewer 自己查** - 观察者不是只收一段 diff：审方案时自己读方案文件并对着真实代码核前提，审代码时在项目里自己跑 `git diff`、读周边文件
 - ✅ **完整记录** - 所有方案、review、代码都保存
 - ✅ **无需手动切换** - AI 之间自动通信
 - ✅ **Git 集成** - 最终生成规范的 commit

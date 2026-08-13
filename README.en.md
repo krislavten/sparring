@@ -8,20 +8,22 @@
 <p align="center">
   <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-2_min-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-core-features"><img src="https://img.shields.io/badge/Features-4_pillars-purple?style=for-the-badge" alt="Features"></a>
-  <a href="#-reviewer-backends"><img src="https://img.shields.io/badge/Backends-Cursor_%7C_Codex_%7C_GLM_%7C_Claude-green?style=for-the-badge" alt="Backends"></a>
+  <a href="#-reviewer-backends"><img src="https://img.shields.io/badge/Backends-Claude_%7C_opencode-green?style=for-the-badge" alt="Backends"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/plugin-Claude_Code-E9DBFC?logo=anthropic&logoColor=black" alt="Claude Code">
-  <img src="https://img.shields.io/badge/version-2.1.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-3.0.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/primary_%2B_fallback-auto--degrade-orange" alt="Fallback">
   <img src="https://img.shields.io/badge/config-JSON_%2B_env-lightgrey" alt="Config">
 </p>
 
-**In one line:** You describe the task. Claude writes the proposal and code. Cursor / Codex / GLM challenges it. Human only steps in for key decisions.
+**In one line:** You describe the task. Claude writes the proposal and code. A second AI walks into the repo and challenges it. Human only steps in for key decisions.
 
 Sparring is a Claude Code plugin. It pairs Claude with a designated opponent — a second AI that assumes there's a bug and tries to find it. Up to 5 rounds, until both agree.
+
+The reviewer isn't a one-shot model call fed a blob of diff text — it's an agent. Hand it a git range and it runs `git diff` itself, opens the files it needs, greps the callers, and forms an opinion with the context in hand.
 
 [中文](README.md)
 
@@ -29,9 +31,11 @@ Sparring is a Claude Code plugin. It pairs Claude with a designated opponent —
 
 ## 📰 What's New
 
-- **2026-06** · 🧠 New **`claude` backend**: run review via the Claude Code CLI (`claude -p`), and **swap the backend model** — point Claude Code at GLM / DeepSeek and other Anthropic-compatible endpoints. Ships with reviewer context isolation (empty cwd + dedicated config dir) + all-tools-disabled, eliminating `CLAUDE.md` pollution and recursion
-- **2026-05** · 🔥 **Zhipu GLM** joins as a third reviewer backend with primary/fallback auto-degradation; new JSON config system (`~/.config/sparring/config.json` + `.sparring/config.json`) for team sharing; repo officially renamed to `sparring` (legacy `workflow` CLI preserved as a symlink)
-- **2026-04** · 🎯 Added **Codex CLI** backend + background review jobs (run long reviews asynchronously)
+- **2026-08** · 🥊 **3.0 (breaking)**: the reviewer stopped taking diff text and became **an agent that goes into the repo itself** — `sparring review --range origin/main...HEAD` creates a read-only snapshot where the reviewer runs `git diff`, reads files, and chases callers on its own. With it: backends narrowed to `claude` + `opencode` (`cursor` / `codex` / `glm` **removed**), piping a diff in is now a hard error, and the diff-size gate and sharding advice are gone
+- **2026-07** · 📓 `sparring review` execution log: one JSONL line per call, so you can tell afterwards which backend reviewed, whether it fell back, and how long it took
+- **2026-06** · 🧠 New **`claude` backend**: run review via the Claude Code CLI (`claude -p`)
+- **2026-05** · 🔥 New JSON config system (`~/.config/sparring/config.json` + `.sparring/config.json`) for team sharing; primary/fallback auto-degradation; repo officially renamed to `sparring` (legacy `workflow` CLI preserved as a symlink)
+- **2026-04** · 🎯 Added background review jobs (run long reviews asynchronously)
 - **2026-03** · Initial release: Claude + Cursor dual-AI collaboration with up to 5-round review; GitHub Issue–driven workflow (claim tasks from a Project board, sync discussions to Issue comments)
 
 ---
@@ -43,13 +47,13 @@ Sparring is a Claude Code plugin. It pairs Claude with a designated opponent —
 <td width="50%">
 
 ### 🥊 Adversarial Dual-AI Review
-One AI writes. Another finds flaws. Not mutual praise — mutual pressure, like boxing sparring partners. **Up to 5 rounds**, no release until both agree.
+One AI writes. Another finds flaws. Not mutual praise — mutual pressure, like boxing sparring partners. The reviewer reads the repo for context instead of guessing from a diff. **Up to 5 rounds**, no release until both agree.
 
 </td>
 <td width="50%">
 
-### 🎛️ Four Backends + Primary/Fallback
-Choose `cursor` / `codex` / `glm` / `claude`, or combine them as primary + fallback. When the primary CLI fails (timeout / network / process crash) the workflow auto-degrades to the fallback — no stall.
+### 🎛️ Two Backends + Primary/Fallback
+Choose `claude` (Claude Code CLI) or `opencode` (plan agent), or combine them as primary + fallback. When the primary CLI fails (timeout / network / process crash) the workflow auto-degrades to the fallback — no stall. Both run on whatever account their CLI is logged into; Sparring stores no API keys.
 
 </td>
 </tr>
@@ -57,13 +61,13 @@ Choose `cursor` / `codex` / `glm` / `claude`, or combine them as primary + fallb
 <td width="50%">
 
 ### ⚙️ Four-Tier Config System
-**Defaults → global config → project config → env vars**. API keys in global (chmod 600), backend choice in project (team-shared), temp overrides via env. One-shot `sparring config init`.
+**Defaults → global config → project config → env vars**. Backend and model live in your own global config; project config carries only team-wide, non-subjective settings (timeout / retries); env vars for temporary overrides. One-shot `sparring config init`.
 
 </td>
 <td width="50%">
 
 ### 📋 GitHub Issue–Driven
-Claim issues from your Project board, AI discussions auto-sync to Issue comments, PR on completion. Every comment carries an identity marker (🧠 Claude / 🤖 Cursor / 🧪 Codex / 🌟 GLM).
+Claim issues from your Project board, AI discussions auto-sync to Issue comments, PR on completion. Every comment carries an identity marker (🧠 Claude Code / 🛠 opencode).
 
 </td>
 </tr>
@@ -80,7 +84,8 @@ AI writes code fast — but mistakes slip through: hallucinated APIs, missed edg
 | AI's every conclusion | Goes straight to you | Vetted by a second AI first |
 | Missed edge cases | 🤷 Caught in PR review | 🛡️ Caught during review loop |
 | Looks-right-but-broken | 😬 Discovered in production | 🎯 "Assume there's a bug" mindset catches it |
-| Cursor / Codex down? | ❌ Workflow stalls | 🔄 Auto-degrades to fallback |
+| Reviewer lacks context | 🙈 Squinting at a bare diff | 🔍 Reviewer opens files and greps callers itself |
+| Primary backend down? | ❌ Workflow stalls | 🔄 Auto-degrades to fallback |
 | Single-perspective blind spots | — | ✅ Always two viewpoints, lower blind-spot risk |
 
 **Result**: more reliable AI output, less manual review, lower cognitive load.
@@ -97,7 +102,7 @@ AI writes code fast — but mistakes slip through: hallucinated APIs, missed edg
 /plugin install sparring@sparring
 ```
 
-### 2. Initialize (auto-installs deps + selects models)
+### 2. Initialize (auto-installs deps + picks a reviewer backend)
 
 ```bash
 # Restart Claude Code, then:
@@ -110,7 +115,7 @@ AI writes code fast — but mistakes slip through: hallucinated APIs, missed edg
 /sparring:workflow add rate limiting to the login endpoint
 ```
 
-That's it. Claude writes the proposal → Cursor challenges → you approve → Claude implements → Cursor challenges again → you ship.
+That's it. Claude writes the proposal → the reviewer challenges it → you approve → Claude implements → the reviewer challenges again → you ship.
 
 ---
 
@@ -156,74 +161,76 @@ That's it. Claude writes the proposal → Cursor challenges → you approve → 
 
 ---
 
+## ⚡ Ad-hoc review: `sparring review`
+
+No task, no workflow — just get one review. Two input shapes:
+
+### Shape 1: review a range of repo changes (recommended)
+
+```bash
+sparring review --range origin/main...HEAD --title "login rate limiting"
+sparring review --range HEAD~3..HEAD
+```
+
+`--range` runs `git worktree add --detach` to build a **read-only snapshot** of that range in a temp dir. The reviewer's working directory *is* that snapshot — it runs `git diff <range>` itself, opens whatever files it needs, greps callers, and the snapshot is deleted when it's done (on success, on failure, and when killed).
+
+Since the diff never enters the prompt, there's **no size limit and nothing to shard**.
+
+### Shape 2: review a conclusion or a proposal
+
+```bash
+echo "Let's use Redis for caching, because…" | sparring review --title "cache choice"
+```
+
+Text review builds no snapshot — the reviewer runs in an empty temp dir and judges the text on its own merits.
+
+### The contract
+
+- The first column of the output is the verdict: `APPROVE` or `CONCERNS`
+- Exit codes: `0` = APPROVE, `2` = CONCERNS, `1` = call failed. **An unparseable verdict counts as an error — it never falls through to approval**
+- Every call appends one JSONL line to `~/.local/state/sparring/review-YYYYMMDD.jsonl` (fields: `ts` / `title` / `mode` / `range` / `input_lines` / `backend` / `via` / `duration_s` / `exit_code` / `verdict`), kept 7 days by default (`review.log_retention_days`, `0` disables), so you can answer "which run timed out, and did it fall back?" after the fact
+
+> ⚠️ **Diff text is no longer accepted.** `git diff ... | sparring review` fails immediately and points you at `--range` — no silent compatibility shim (detection: a stdin line starting with `diff --git ` or `--- a/`). `--range` mode also **doesn't read stdin** — in non-interactive environments stdin is often a pipe that never closes, and reading it hangs forever. Passing `--range` together with text content is an error too.
+
+> 🔒 **What "read-only" means here**: the reviewer has Bash (it can't run `git diff` otherwise), so nothing at the tool layer stops it from writing files. The read-only property comes from being detached (no branch is touched) plus deleting the snapshot afterwards — not from filesystem permissions. The snapshot shares the main repo's `.git` object store. Don't treat it as a sandbox.
+
+---
+
 ## 🎛️ Reviewer Backends
 
-Four backends, freely combinable as primary + fallback:
+Two backends, freely combinable as primary + fallback. Both run on whatever account their CLI is already logged into — Sparring stores no API keys:
 
-| Backend | Account | Notes | Best for |
-|---------|---------|-------|---------|
-| 🌟 `glm` | Zhipu pay-as-you-go | **Default backend**, just needs an API key | Daily driver / no subscription |
-| 🤖 `cursor` | Cursor subscription | `gpt-5.5-extra-high` | When you have a Cursor subscription |
-| 🧪 `codex` | OpenAI subscription | Codex CLI, tunable reasoning | Codex quota to burn |
-| 🧠 `claude` | Claude Code CLI | Runs review via `claude -p`; can **swap the backend model** (native Claude / GLM / DeepSeek...) | Use the Claude Code harness, or drive a third-party model with it |
+| Backend | How it runs | Tool permissions |
+|---------|-------------|------------------|
+| 🧠 `claude` | Claude Code CLI (`claude -p`, non-interactive), **default primary** | Allows `Bash` + `Read` / `Grep` / `Glob`; denies `Edit` / `Write` / `NotebookEdit` / `Task` / `WebFetch` / `WebSearch` |
+| 🛠 `opencode` | `opencode run --agent plan`, **default fallback** | The plan agent has no editing ability to begin with |
+
+> Write and network tools are denied, but Bash isn't — the reviewer needs it for `git diff` and `grep`. So "the reviewer won't touch anything" rests on the snapshot being thrown away, not on tool permissions. See the note above.
 
 ### Primary + Fallback
 
 If the primary backend fails (timeout / network error / CLI crash), Sparring **auto-degrades** to the fallback. Workflow doesn't stall:
 
 ```
-⚠ Primary backend Cursor Agent failed, falling back to GLM...
+⚠ 主 backend Claude Code 调用失败，降级到 opencode (plan)...
 ```
 
-**Common setups**:
+(The CLI speaks Chinese: "primary backend Claude Code failed, falling back to opencode (plan)".)
+
+**Common setups** (put these in your **global** config `~/.config/sparring/config.json` — never set a backend at project level):
 
 ```jsonc
-// A) GLM only (default — works with no subscription, pay-as-you-go)
-{ "review": { "backend": "glm" } }
+// A) Default: Claude Code primary + opencode fallback
+{ "review": { "backend": "claude", "fallback": "opencode" } }
 
-// B) GLM primary + Claude Code fallback (optional, if you already have Claude Code logged in locally)
-{ "review": { "backend": "glm", "fallback": "claude" } }
+// B) The other way around: opencode primary, Claude Code as backup
+{ "review": { "backend": "opencode", "fallback": "claude" } }
 
-// C) Cursor primary + GLM fallback (when you have a Cursor subscription)
-{ "review": { "backend": "cursor", "fallback": "glm" } }
-
-// D) Codex primary + GLM fallback (preserve Codex quota)
-{ "review": { "backend": "codex", "fallback": "glm" } }
-
-// E) Claude Code (native — uses your logged-in Claude)
-{ "review": { "backend": "claude" },
-  "claude": { "model": "claude-opus-4-8" } }
+// C) One backend only, no degradation
+{ "review": { "backend": "claude", "fallback": null } }
 ```
 
-### 🧠 `claude` backend: run third-party models through Claude Code
-
-The `claude` backend runs review via the **Claude Code CLI (`claude -p`)**. Beyond native Claude, you can **swap the backend model to GLM / DeepSeek / etc.** by pointing `claude.base_url` + `api_key` + `model` at each vendor's **Anthropic-compatible endpoint**:
-
-```jsonc
-// Claude Code running GLM
-{ "review": { "backend": "claude" },
-  "claude": {
-    "base_url": "https://open.bigmodel.cn/api/anthropic",
-    "api_key": "<glm-key>",
-    "model": "glm-5.2"
-  } }
-
-// Claude Code running DeepSeek, native GLM as fallback
-{ "review": { "backend": "claude", "fallback": "glm" },
-  "claude": {
-    "base_url": "https://api.deepseek.com/anthropic",
-    "api_key": "<deepseek-key>",
-    "model": "deepseek-chat"
-  } }
-```
-
-How it works & isolation (important):
-
-- **Native Claude**: leave `base_url` empty — reuses your logged-in Claude Code (OAuth subscription or `ANTHROPIC_API_KEY`), zero extra config.
-- **Third-party model**: set `base_url` (`api_key` then **required**) → injects `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_MODEL`, and explicitly clears `ANTHROPIC_API_KEY` so a stray local key can't hijack auth and 401.
-- **Context isolation**: the reviewer always runs inside an empty `mktemp` dir (blocks project `CLAUDE.md`); third-party path also uses a fresh empty `CLAUDE_CONFIG_DIR` (blocks global `CLAUDE.md` + residual login). The **native path** loads `~/.claude/CLAUDE.md` — `verify` warns about it; set `claude.config_dir` to a "logged-in but CLAUDE.md-free" dir to fully isolate.
-- **All tools disabled**: `-p` default-deny + `--disallowedTools` → the reviewer only emits a plain-text verdict, physically can't run Bash/Task, so recursion is impossible.
-- **Proxy**: domestic endpoints (GLM/DeepSeek) clear `HTTP(S)_PROXY` by default (a proxy breaks them); set `claude.use_proxy: true` if native Anthropic needs a proxy.
+> ⚠️ **`cursor` / `codex` / `glm` were removed in 3.0.** A config still holding one of those values **exits with an error** (no silent downgrade) — switch it to `claude` or `opencode`, or re-run `sparring config init --force`.
 
 ---
 
@@ -232,25 +239,28 @@ How it works & isolation (important):
 Precedence (low → high): **defaults → global → project → env vars**.
 
 ```bash
-sparring config init              # create ~/.config/sparring/config.json (chmod 600, stores api_key)
-sparring config init project      # create .sparring/config.json (team-shared, no key)
-sparring config show              # merged config (keys masked)
-sparring config get glm.api_key   # single value (sensitive fields masked)
+sparring config init                # create ~/.config/sparring/config.json (chmod 600)
+sparring config init project        # create .sparring/config.json (team-shared, no backend/model)
+sparring config show                # merged config
+sparring config get review.backend  # single value
 ```
 
-**Global config** `~/.config/sparring/config.json` (contains api_key, do **not** commit):
+**Global config** `~/.config/sparring/config.json`:
 
 ```json
 {
   "review": {
-    "backend": "glm",
-    "fallback": null,
-    "timeout": 120,
-    "retries": 1
+    "backend": "claude",
+    "fallback": "opencode",
+    "timeout": 1800,
+    "retries": 1,
+    "log_retention_days": 7
   },
-  "glm": {
-    "api_key": "<id.secret>",
-    "model": "glm-5.1"
+  "claude": {
+    "model": null
+  },
+  "opencode": {
+    "model": null
   }
 }
 ```
@@ -260,51 +270,50 @@ sparring config get glm.api_key   # single value (sensitive fields masked)
 ```json
 {
   "review": {
-    "timeout": 120,
+    "timeout": 1800,
     "retries": 1
   }
 }
 ```
 
-> ⚠️ **Never set `review.backend` / `fallback` / model / `api_key` in project config.** Which reviewer backend and model to use is each developer's own choice via **their own global config** (project config wins over global, so setting it there would override everyone's personal choice); `api_key` especially must never be committed.
+> ⚠️ **Never set `review.backend` / `fallback` / model in project config.** Which reviewer backend and model to use is each developer's own choice via **their own global config** — project config wins over global, so setting it there would override everyone's personal choice.
 
 **Env var overrides** (`SPARRING_*` preferred; `WORKFLOW_*` kept for backward compat):
 
 ```bash
-export SPARRING_REVIEW_BACKEND=glm       # → review.backend
-export SPARRING_GLM_API_KEY=<id.secret>  # → glm.api_key
-export SPARRING_REVIEW_TIMEOUT=180       # → review.timeout (example: temporary manual override; default is already 120, usually no need to set this)
+export SPARRING_REVIEW_BACKEND=opencode  # → review.backend
+export SPARRING_REVIEW_FALLBACK=claude   # → review.fallback
+export SPARRING_REVIEW_TIMEOUT=900       # → review.timeout (temporary bump; default is already 1800)
 ```
 
-> ⏱️ **Adaptive timeout for large diffs**: `review.timeout` is just the starting value for a single call (default 120s). The actual per-call timeout auto-scales with the size of the reviewed content — +30s per 10,000 bytes, capped at +480s (600s per call) — so large diffs/refactors no longer need a manual `SPARRING_REVIEW_TIMEOUT` bump to complete.
+> 💡 **There are no API keys in the config.** Both backends use the account their own CLI is logged into (`claude login` / `opencode auth login`); Sparring only picks the backend and the model, so a new machine just needs each CLI logged in once.
+
+> ⏱️ **Timeouts are measured in minutes**: the reviewer is an agent running git and reading files, so a single review takes minutes — hence `review.timeout` defaults to 1800s. The pre-3.0 "scale the timeout with the size of the content" behavior is gone: the diff no longer enters the prompt, so there's nothing to scale against. It's a flat value now.
 >
-> ⚠️ **Retries multiply the worst-case wait linearly**: each retry reuses the full (already-adaptive) per-call timeout — it's never shrunk. With the default `review.retries=1` (2 attempts total) and a large diff capped at 600s per call, a single `sparring review` can take up to **1200s (20 min)** before failing. This is intentional — retries exist to absorb transient network errors, and shrinking the retry budget would make retries on large diffs fail by construction. Set `review.retries=0` to disable retries if you'd rather fail fast, or use your own judgment on when to give up waiting.
+> ⚠️ **Retries multiply the worst-case wait linearly**: each retry reuses the full per-call timeout — it's never shrunk. With the default `review.retries=1` (2 attempts total), a single `sparring review` can take up to **1200s (20 min)** before failing. This is intentional — retries exist to absorb transient network errors. Set `review.retries=0` if you'd rather fail fast.
 
 ### Config reference
 
 | key | default | notes |
 |---|---|---|
-| `review.backend` | `glm` | Primary: `cursor` / `codex` / `glm` / `claude` |
-| `review.fallback` | `null` | Fallback backend (optional) |
-| `review.timeout` | `120` | Starting per-call timeout in seconds (auto-scales with content size, see above) |
+| `review.backend` | `claude` | Primary backend; only `claude` or `opencode` |
+| `review.fallback` | `opencode` | Fallback backend; `null` disables degradation |
+| `review.timeout` | `1800` | Per-call timeout in seconds (flat — no adaptive scaling) |
 | `review.retries` | `1` | Retries after failure (total attempts = retries + 1) |
-| `cursor.model` | from `agents/cursor.md` | Cursor Agent model |
-| `codex.model` | from codex config | Codex model |
-| `codex.effort` | `null` | `none\|minimal\|low\|medium\|high\|xhigh` |
-| `codex.home` | `/tmp/workflow-codex-home-<user>` | Codex local state directory |
-| `glm.api_key` | **required** | [Get one](https://open.bigmodel.cn/usercenter/apikeys) |
-| `glm.model` | `glm-5.1` | Zhipu model |
-| `glm.thinking` | `disabled` | `enabled` for higher quality but slower |
-| `glm.max_tokens` | `8192` | bump to `65536` when thinking is enabled |
-| `glm.temperature` | `0.3` | review doesn't need high creativity |
-| `glm.api_base` | official URL | swap for self-hosted gateway |
+| `review.log_retention_days` | `7` | Days to keep the execution log; `0` disables logging entirely |
+| `claude.model` | `null` | Empty = whatever Claude Code defaults to |
+| `claude.use_proxy` | `false` | When `false`, `HTTP(S)_PROXY` is cleared before the call; set `true` if you need a proxy to reach the backend |
+| `claude.extra_args` | `null` | Extra `claude` CLI args (escape hatch) |
+| `opencode.model` | `null` | Empty = whatever opencode defaults to |
+| `opencode.use_proxy` | `false` | Same as `claude.use_proxy` |
+| `opencode.extra_args` | `null` | Extra `opencode` CLI args (escape hatch) |
 
 Run `sparring config show` anytime to inspect the full effective config.
 
 ### Verify
 
 ```bash
-sparring verify   # checks primary/fallback connectivity + model + masked key
+sparring verify   # checks jq / git, then probes each backend CLI: installed? reachable?
 ```
 
 ---
@@ -323,10 +332,8 @@ Every comment carries an identity marker:
 
 | Icon | Role | Purpose |
 |---|---|---|
-| 🧠 | Claude Code | Proposals, implementation |
-| 🤖 | Cursor Agent | Review feedback |
-| 🧪 | Codex CLI | Review feedback |
-| 🌟 | GLM | Review feedback |
+| 🧠 | Claude Code | Proposals, implementation; review feedback when it's the reviewer |
+| 🛠 | opencode | Review feedback |
 | 🔧 | Workflow | Status transitions |
 
 ---
@@ -385,6 +392,12 @@ sparring setup                  # interactive installer
 sparring config init            # create global config
 sparring verify                 # check environment
 
+# Ad-hoc review (no task; uses the configured backend — see "Ad-hoc review" above)
+sparring review --range origin/main...HEAD --title "<what changed>"   # review repo changes
+echo "<conclusion/proposal>" | sparring review --title "<topic>"      # review text
+#   exit codes 0=APPROVE  2=CONCERNS  1=call error / unparseable verdict
+#   ⚠ diff text is rejected — piping a diff in is a hard error; use --range
+
 # Task lifecycle
 sparring create <name> <claude|cursor>
 sparring propose <task-id>
@@ -417,7 +430,7 @@ Full list: `sparring help`. **Compat alias**: `workflow xxx` still works (`bin/w
 
 ## 🤝 Contributing
 
-Issues and PRs welcome. This project itself is developed using Sparring — you can see every change on main has been through Cursor/Codex review.
+Issues and PRs welcome. This project itself is developed using Sparring — every change on main has been through a `sparring review`.
 
 ## License
 

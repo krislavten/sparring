@@ -1,7 +1,7 @@
 {
   "name": "sparring",
-  "description": "AI peer review — Claude writes, Cursor/Codex/GLM challenges",
-  "version": "2.3.0",
+  "description": "AI peer review — reviewer 是个 agent，自己进仓库查改动",
+  "version": "3.0.0",
   "author": {
     "name": "krislavten"
   },
