@@ -1106,8 +1106,16 @@ _adversarial_prompt() {
 # 从 reviewer 输出提取裁决词。严格匹配列首大写（reviewer prompt 强制此格式），
 # 不用 -i、不容前导空格，避免审查正文里的 approve/concerns 误命中。
 # 解析不出时输出空串——调用方一律按"未通过/错误"处理，绝不默认放行。
+# 2026-09-15：改取**最后一条独占行**（prompt 已要求裁决词单独作末行）。
+# 首行前缀匹配会被正文里的「CONCERNS 清单为空——…」「CONCERNS 候选全部排除…」带成 CONCERNS
+# （09-14/09-15 三次实例，APPROVE 被判 exit=2）。找不到独占行时退回前缀匹配，但取最后一条。
 _verdict_of() {
-    printf '%s' "$1" | grep -m1 -oE '^(APPROVE|CONCERNS)' || true
+    local v
+    v=$(printf '%s' "$1" | grep -oE '^(APPROVE|CONCERNS)[[:space:]]*$' | tail -1 | tr -d '[:space:]') || true
+    if [[ -z "$v" ]]; then
+        v=$(printf '%s' "$1" | grep -oE '^(APPROVE|CONCERNS)' | tail -1) || true
+    fi
+    printf '%s' "$v"
 }
 
 # claude /code-review 的输出翻译成统一裁决契约。

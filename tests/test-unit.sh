@@ -654,6 +654,19 @@ test_review_run_no_verdict_exit1() {
 }
 test_review_run_no_verdict_exit1
 
+test_review_run_prose_concerns_prefix_not_verdict() {
+    source_workflow_funcs
+    # 正文里以 CONCERNS 开头的叙述句（「CONCERNS 清单为空」）不是裁决；裁决取最后一条独占行
+    assert_eq "行首 CONCERNS 叙述句不压过末行 APPROVE" "0" "$(_review_run_status '逐角度核实如下：
+CONCERNS 清单为空——逐角度核实如下：
+1. 无行为变更
+APPROVE')"
+    assert_eq "末行 CONCERNS 仍判 CONCERNS" "2" "$(_review_run_status 'APPROVE 候选先排除：
+1. 有问题
+CONCERNS')"
+}
+test_review_run_prose_concerns_prefix_not_verdict
+
 test_review_run_backend_failure_propagates() {
     source_workflow_funcs
     call_reviewer() { return 1; }
