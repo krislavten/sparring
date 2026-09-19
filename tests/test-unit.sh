@@ -2397,6 +2397,35 @@ test_job_reap_ignores_completed() {
 test_job_reap_ignores_completed
 
 echo ""
+echo "=== 裁决解析：一致性闸（正文有 finding 不许 APPROVE）==="
+
+# 2026-09-19：`_verdict_of` 取「最后一条独占行」是 09-15 为修「首个前缀误匹配」刻意改的，
+# 副作用是「正文末尾复述裁决词」变成覆盖（oncall #3402：正文 CONCERNS + 两条 finding、
+# 末行 APPROVE ⇒ 解析成 APPROVE）。闸不依赖位置：正文 finding 计数 > 0 ⇒ 强制 CONCERNS。
+test_verdict_gate_body_findings_force_concerns() {
+    source_workflow_funcs
+    local body v err
+    body=$'CONCERNS\n\n1. `a.ts:1` — 某处不对。MUST-FIX\n\n2. `b.ts:2` — 另一处。SHOULD-FIX\n\nAPPROVE'
+    err="$TMP_DIR/verdict-gate.err"
+    v=$(_verdict_of "$body" 2>"$err")
+    assert_eq "正文有 finding + 末行 APPROVE ⇒ 判 CONCERNS" "CONCERNS" "$v"
+    assert_eq "stderr 打出 override 说明" "1" "$(grep -c 'verdict overridden: body has' "$err" 2>/dev/null | tr -d '[:space:]')"
+}
+test_verdict_gate_body_findings_force_concerns
+
+# 阴性对照：没有 finding 的纯 APPROVE 必须照常通过 —— 没有这条，上面那条可以被
+# 「无条件返回 CONCERNS」的实现骗过（闸不能把所有 APPROVE 都吃掉）。
+test_verdict_gate_clean_approve_stays_approve() {
+    source_workflow_funcs
+    local body v err
+    body=$'APPROVE\n\n本次改动未发现问题。'
+    err="$TMP_DIR/verdict-clean.err"
+    v=$(_verdict_of "$body" 2>"$err")
+    assert_eq "无 finding 的 APPROVE 保持 APPROVE" "APPROVE" "$v"
+    assert_eq "阴性对照：不打 override" "0" "$(grep -c 'verdict overridden' "$err" 2>/dev/null | tr -d '[:space:]')"
+}
+test_verdict_gate_clean_approve_stays_approve
+
 echo "=== opencode 网关认证注入 ==="
 
 # ─────────────────────────────────────────────────────────────────────────────

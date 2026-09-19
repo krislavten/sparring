@@ -1229,6 +1229,24 @@ _verdict_of() {
     if [[ -z "$v" ]]; then
         v=$(printf '%s' "$1" | grep -oE '^(APPROVE|CONCERNS)' | tail -1) || true
     fi
+    # 一致性闸（2026-09-19）：正文有 finding 就不许 APPROVE。
+    #
+    # 成因是上一个修复的副作用：本函数 2026-09-15 从「首个前缀匹配」改成「最后一条独占行」
+    # （见上方注释），正好把「正文末尾复述裁决词」变成了覆盖 —— oncall #3402 实例：
+    # 腿正文先 CONCERNS + 两条 finding、末尾又写了一行 APPROVE ⇒ 解析出 APPROVE。
+    # 这是本工具里唯一一种**返回门的通过态**的假读数：空返回看得见（没结论），
+    # 假 APPROVE 看起来就是过了。所以不再在「第一条 / 最后一条」之间挑 —— 两头都有反例 ——
+    # 改为加一条不依赖位置的一致性判据：**正文含 finding 计数 > 0 ⇒ 强制 CONCERNS**。
+    # 方向是 fail-closed：宁可把「正文提了 finding 又说 APPROVE」判成 CONCERNS 让人再看一眼。
+    if [[ "$v" == "APPROVE" ]]; then
+        local _n
+        _n=$(printf '%s' "$1" | grep -cE 'MUST-FIX|SHOULD-FIX|BLOCKER|finding' 2>/dev/null) || _n=0
+        [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
+        if [[ "$_n" -gt 0 ]]; then
+            echo "verdict overridden: body has $_n findings" >&2
+            v=CONCERNS
+        fi
+    fi
     printf '%s' "$v"
 }
 
