@@ -1590,6 +1590,56 @@ _review_snapshot_create() {
 }
 
 # 幂等：没建过、已删过、目录已消失都安全。
+# _term_record_identity —— **只在 INT/TERM 路径**把自己这棵树的身份写进 jsonl。
+#
+# ⚠️ 为什么不记 $PPID：$PPID 是「谁启动了我」，不是「谁杀了我」。信号发送方 PID
+# 只存在于 sigaction(SA_SIGINFO) 的 si_pid 里，**bash 的 trap 拿不到** —— 这是能力
+# 边界，不是写法问题。记 $PPID 会得到一个永远正确、但与问题无关的量，而且它
+# 看起来像证据：下次有人按它去查，查到的是无辜的父进程。
+#
+# 改为记 **argv**：`pkill -f <pattern>` 匹配的就是 argv，于是「谁杀的」这个不可答
+# 的问题，变成「**哪些 pattern 打得到这棵树里的谁**」这个可离线判定的问题。
+# ⚠️ `pkill -f` **不看 cwd** —— 快照路径只在 cwd 里，不构成被匹配的理由。
+#
+# ⚠️ **EXIT 路径刻意不写这条记录**（v1 的缺陷）：trap 若绑在 EXIT 上，正常跑完的
+# 每一轮都会写一条 `term_received` ⇒ 它成为**恒真信号**、区分不了任何事情，而名字
+# 还宣称是 TERM。bash 没有「当前是哪个信号」的变量，只能靠**给不同信号绑不同
+# handler** 来分开，所以下面是两条 trap 而不是一条。
+#
+# group_args 取 **self 自己的进程组**（self 的 pgid）。
+# ⚠️ **已知局限，别读成「腿一定在里面」**：本脚本 `:854-856` 自述「GNU timeout 默认
+# 把子进程放进**新**进程组」⇒ **腿很可能不在 self 的组里**。要精确拿到腿的 argv，
+# 得把腿的 pid 接线出来（`timeout` 那层记 `$!`），本补丁**没有做**。
+#
+# trap 里只跑必然快的命令，且每条都 `|| true`：trap 里的失败会污染退出码，
+# 而我们正在查的就是退出码。
+_term_record_identity() {
+    local log_dir="${SPARRING_STATE_DIR:-$HOME/.local/state/sparring}"
+    mkdir -p "$log_dir" 2>/dev/null || true
+    local f="$log_dir/review-$(date +%Y%m%d).jsonl"
+
+    local self_args self_pgid self_sid group_args
+    self_args=$(ps -o args= -p "$$" 2>/dev/null | head -1) || true
+    self_pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || true
+    self_sid=$(ps -o sess= -p "$$" 2>/dev/null | tr -d ' ') || true
+    group_args=""
+    if [[ -n "${self_pgid:-}" ]]; then
+        group_args=$(ps -o pid=,args= -g "$self_pgid" 2>/dev/null) || true
+    fi
+
+    jq -nc \
+        --arg ts "$(date -Iseconds)" \
+        --arg self_pid "$$" \
+        --arg self_pgid "${self_pgid:-}" \
+        --arg self_sid "${self_sid:-}" \
+        --arg self_args "${self_args:-}" \
+        --arg group_args "${group_args:-}" \
+        '{ts:$ts, event:"term_received", self_pid:$self_pid, self_pgid:$self_pgid,
+          self_sid:$self_sid, self_args:$self_args,
+          group_args:(if $group_args == "" then null else ($group_args|split("\n")) end)}' \
+        >> "$f" 2>/dev/null || true
+}
+
 _review_snapshot_cleanup() {
     [[ -n "$_REVIEW_SNAPSHOT" ]] || return 0
     local dir="$_REVIEW_SNAPSHOT"
@@ -1795,7 +1845,10 @@ _review_range() {
     # 快照清理走 trap：审查中途被 Ctrl-C / kill(TERM) 时也要收干净，
     # 只靠 per-return 清理的话中断路径会漏。实测 bash 3.2 下命令替换子 shell
     # 不触发 EXIT trap，所以 call_reviewer 那层的 $(...) 不会误删快照。
-    trap '_review_snapshot_cleanup' EXIT INT TERM
+    # ⚠️ 两条 trap，不是一条：**EXIT 只清快照**（正常跑完的每轮都会走这条，写记录会
+    # 变成恒真信号）；**只有 INT/TERM 才记身份**，`|| true` 保证 trap 不污染退出码。
+    trap '_review_snapshot_cleanup' EXIT
+    trap '_term_record_identity || true; _review_snapshot_cleanup' INT TERM
     if ! _review_snapshot_create "$right"; then
         trap - EXIT INT TERM
         return 1
