@@ -2399,6 +2399,37 @@ test_job_reap_ignores_completed
 echo ""
 echo "=== opencode 网关认证注入 ==="
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TODO（2026-09-19 定位，未修；修法归工具仓 owner）
+#
+# 本节有 3 条**长期红**的断言，全是同一个原因：
+#   ✗ 未配网关时 model 原样透传   expected some/model            actual 空
+#   ✗ 缺 api_key 时不启用网关      expected m1                    actual 空
+#   ✗ model 被加上 provider 前缀   expected sparring-gw/gpt-test  actual 空
+#
+# **结论：产品侧没有问题，是这三条测试按一个不存在的接口写的（测试夹具口径问题）。**
+#
+# `_opencode_gateway_setup`（bin/sparring:1166）**从不向 stdout 写任何东西**——它的契约是
+# 「设置两个全局：`_OPENCODE_GW_MODEL` 与 `_OPENCODE_GW_CONFIG`」。两个生产调用点
+# （bin/sparring:1283、:3125）都是**裸调用后读全局**：
+#     _opencode_gateway_setup
+#     model="$_OPENCODE_GW_MODEL"
+#     gw_config="$_OPENCODE_GW_CONFIG"
+# 而这三条测试写的是 `m=$(_opencode_gateway_setup)`，**捕获的是 stdout**，所以恒为空。
+# 该函数自引入起（commit 70ba773）就没写过 stdout，即这三条**从写下那天就是红的**。
+#
+# 没人发现的原因：本套件的通过/失败门此前是死的（errexit 被一个用例意外全局打开，
+# 套件跑到 2/3 被 143 打断，`Results:` 与退出码从不执行）。2026-09-19 门修好后它们才现形。
+# 同节其余断言之所以绿，是因为它们直接读全局 `$_OPENCODE_GW_CONFIG`——本节里甚至已有
+# 一条注释承认「`$(...)` 子 shell 里全局传不回来，所以重跑一次拿文件路径」，
+# 作者当时对 `_OPENCODE_GW_CONFIG` 想到了这点，对 model 没有。
+#
+# 修法（一行）：改成裸调用 + 断言全局，与生产调用点一致：
+#     _opencode_gateway_setup
+#     assert_eq "..." "some/model" "$_OPENCODE_GW_MODEL"
+# ⚠ 注意别再套 `$(...)`，那会把整个调用关进子 shell、全局照样传不回来。
+# ─────────────────────────────────────────────────────────────────────────────
+
 test_resolve_secret() {
     source_workflow_funcs
     assert_eq "字面量原样返回" "sk-literal" "$(_resolve_secret 'sk-literal')"
