@@ -1240,7 +1240,9 @@ _verdict_of() {
     # 方向是 fail-closed：宁可把「正文提了 finding 又说 APPROVE」判成 CONCERNS 让人再看一眼。
     if [[ "$v" == "APPROVE" ]]; then
         local _n
-        _n=$(printf '%s' "$1" | grep -cE 'MUST-FIX|SHOULD-FIX|BLOCKER|finding' 2>/dev/null) || _n=0
+        # 09-19 05:2xZ lead 收窄：引用旧轮 finding（「r1 finding 2 的处置成立」）、否定式（no/0 findings、
+        # findings=0）不是新 finding，先剔除这些行再数；严重度标签仍裸计。今晚 #3397/#3427 三轮 APPROVE 因此误判。
+        _n=$(printf '%s' "$1" | grep -viE '(no|zero|0) findings?|findings?[ =:]*0\b|\br[0-9]+ finding|上一?轮 finding|finding [0-9]+ 的' | grep -cE 'MUST-FIX|SHOULD-FIX|BLOCKER|finding' 2>/dev/null) || _n=0
         [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
         if [[ "$_n" -gt 0 ]]; then
             echo "verdict overridden: body has $_n findings" >&2
