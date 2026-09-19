@@ -188,7 +188,9 @@ echo "建议用 Redis 做缓存，理由是……" | sparring review --title "�
 
 - 输出首列就是裁决词：`APPROVE` 或 `CONCERNS`
 - 退出码：`0` = APPROVE，`2` = CONCERNS，`1` = 调用错误。**解析不出裁决按错误处理，绝不默认放行**
-- 每次调用追加一行 JSONL 到 `~/.local/state/sparring/review-YYYYMMDD.jsonl`（字段 `ts` / `title` / `mode` / `range` / `input_lines` / `backend` / `via` / `duration_s` / `exit_code` / `verdict`），默认保留 7 天（`review.log_retention_days`，`0` = 禁用），用来事后查"哪次超时了、有没有降级"
+- 每次调用追加一行 JSONL 到 `~/.local/state/sparring/review-YYYYMMDD.jsonl`（字段 `ts` / `title` / `mode` / `range` / `input_lines` / `backend` / `via` / `duration_s` / `exit_code` / `verdict` / `error_reason` / `error_sample`），默认保留 7 天（`review.log_retention_days`，`0` = 禁用），用来事后查"哪次超时了、有没有降级"
+- 腿失败（`timeout` / `crash` / `empty` / `parse`）时，把腿的 stdout/stderr 各前 4KB（连接串/token 形态脱敏后）留一份到 `~/.local/state/sparring/errors/<ts>-<原因>.txt`，JSONL 的 `error_sample` 指向它。降级后成功的轮次也可能有值——那指向被降级吸收掉的那次失败
+- 主腿返回空、本轮耗时 <120s、且退出码是 1（腿自己的失败，不是被信号打断）时，自动重试一次主腿再走降级链
 
 > ⚠️ **不再接收 diff 文本**。`git diff ... | sparring review` 会直接报错并提示改用 `--range`，不做静默兼容（判定：stdin 里有 `diff --git ` 或 `--- a/` 打头的行）。`--range` 模式**不读 stdin**——非交互环境里 stdin 常是个不会关闭的管道，读它会永久卡死；`--range` 和文本内容同时给也会报错。
 

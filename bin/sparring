@@ -251,7 +251,9 @@ _config_defaults() {
   "claude": {
     "model": null,
     "use_proxy": false,
-    "extra_args": null
+    "extra_args": null,
+    "settings": null,
+    "range_mode": "unified"
   },
   "opencode": {
     "model": null,
@@ -929,6 +931,89 @@ _error_reason_record() {
     printf '%s\n' "$1" > "$SPARRING_ERROR_REASON_FILE" 2>/dev/null || true
 }
 
+# ─── 失败留样 ────────────────────────────────────────────────
+# verdict=ERROR 的轮次此前只留一个原因码：empty/parse 的原始输出看完即弃，
+# 失败率只能靠人工重试吸收，事后无从归因。这里把腿的 stdout/stderr 各留前 4KB 到
+# ${XDG_STATE_HOME:-~/.local/state}/sparring/errors/<ts>-<reason>.txt，
+# JSONL 用 error_sample 字段指回来。过期与开关跟 review.log_retention_days 一致
+# （0 = 同样禁用）；旁路性质与执行日志相同——写失败静默，绝不影响 review 本身。
+_ERROR_SAMPLE_MAX_BYTES=4096
+
+# 过期留样清理，跟 JSONL 同一保留天数。调用点有两处：_review_log_append（每轮都跑）
+# 与 _error_sample_write（每次写留样）——只挂在写留样上的话，之后长期无失败时
+# 旧留样会一直躺在盘上，保留天数就成了空头承诺。
+_error_sample_cleanup() {
+    local days="${1:-}"
+    [[ "$days" =~ ^[0-9]+$ ]] || days=7
+    [[ "$days" == "0" ]] && return 0
+    local dir
+    dir="$(_review_log_dir)/errors"
+    [[ -d "$dir" ]] || return 0
+    find "$dir" -maxdepth 1 -name '*.txt' -type f -mtime +"$days" -delete 2>/dev/null || true
+}
+
+# 脱敏过滤器（stdin → stdout）。按形态替换连接串/token，认不出的一律原样放过。
+# 这是降噪不是安全边界：真正的密钥本就不该出现在腿的输出里，这里只是让留样
+# 可以被安全地贴进排查材料。新增形态往这个函数里加，不要在调用点散着写。
+_redact_sample() {
+    sed -E \
+        -e 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]+@#\1<redacted>@#g' \
+        -e 's#(postgres|postgresql|mysql|mongodb\+srv|mongodb|rediss|redis|amqps|amqp|mssql)://[^[:space:]]+#<redacted-conn>#g' \
+        -e 's#([Aa]uthorization:[[:space:]]*[A-Za-z]+[[:space:]]+)[^[:space:]]+#\1<redacted>#g' \
+        -e "s#(^|[^A-Za-z0-9_-])(sk-ant-|sk-|xox[baprs]-|gh[pousr]_|github_pat_|glpat-|AKIA)[A-Za-z0-9_-]{8,}#\1<redacted>#g" \
+        -e 's#(^|[^A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}#\1<redacted-jwt>#g' \
+        -e "s#([A-Za-z_]*([Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Dd][Ss][Nn]|[Cc][Rr][Ee][Dd])[A-Za-z_]*[[:space:]]*[=:][[:space:]]*[\"']?)[^[:space:]\"',;}]+#\1<redacted>#g" \
+        -e 's#([?&](api[-_]?key|key|token|access_token|apikey)=)[^&[:space:]]+#\1<redacted>#g'
+}
+
+# _error_sample_write <reason> <backend> <leg_rc> <stdout_src> [<stderr_src>]
+# stdout_src / stderr_src 是文件路径；留样路径打到 stdout，未启用或写失败输出空串。
+# 调用方必须在清理临时文件之前调它（这是留样的唯一来源）。调用之前的失败
+# （backend 不在 PATH、方法论文件缺失）没有腿输出可留，不走这里，error_sample 记 null。
+_error_sample_write() {
+    local reason="$1" backend="$2" leg_rc="$3" out_src="${4:-}" err_src="${5:-}"
+    local days
+    days=$(_review_log_retention_days)
+    [[ "$days" == "0" ]] && return 0
+    local dir ts target
+    dir="$(_review_log_dir)/errors"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    _error_sample_cleanup "$days"
+    ts=$(date '+%Y%m%dT%H%M%S%z')
+    target="${dir}/${ts}-${reason}.txt"
+    # 同一秒里两条腿都失败：不许互相覆盖，往后找一个空位
+    if [[ -e "$target" ]]; then
+        local i=2
+        while [[ -e "${dir}/${ts}-${reason}-${i}.txt" && $i -lt 100 ]]; do i=$(( i + 1 )); done
+        target="${dir}/${ts}-${reason}-${i}.txt"
+    fi
+    {
+        printf '%s\n' "# sparring 失败留样（每段前 ${_ERROR_SAMPLE_MAX_BYTES} 字节，按形态脱敏）"
+        printf 'ts: %s\nreason: %s\nbackend: %s\nleg_exit_code: %s\n' \
+            "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$reason" "$backend" "$leg_rc"
+        [[ -n "${_RV_MODE:-}" ]] && printf 'mode: %s\nrange: %s\n' "$_RV_MODE" "${_RV_RANGE:-}"
+        printf '%s\n' '--- stdout ---'
+        # 先脱敏、再按 4KB 截断：反过来的话，正好跨在 4KB 边界上的 token 会被截成"半截密钥"。
+        # 脱敏之前那个 32KB 只是给 sed 限流（超大输出不必全量过一遍），超出部分本来也进不了 4KB 段。
+        [[ -n "$out_src" && -f "$out_src" ]] && head -c "$(( _ERROR_SAMPLE_MAX_BYTES * 8 ))" "$out_src" 2>/dev/null \
+            | _redact_sample 2>/dev/null | head -c "$_ERROR_SAMPLE_MAX_BYTES" || true
+        printf '\n%s\n' '--- stderr ---'
+        [[ -n "$err_src" && -f "$err_src" ]] && head -c "$(( _ERROR_SAMPLE_MAX_BYTES * 8 ))" "$err_src" 2>/dev/null \
+            | _redact_sample 2>/dev/null | head -c "$_ERROR_SAMPLE_MAX_BYTES" || true
+        printf '\n'
+    } > "$target" 2>/dev/null || { rm -f "$target" 2>/dev/null || true; return 0; }
+    [[ -s "$target" ]] || { rm -f "$target" 2>/dev/null || true; return 0; }
+    chmod 600 "$target" 2>/dev/null || true
+    printf '%s' "$target"
+}
+
+# 留样路径跟 backend 状态一样用文件回传（_call_backend 跑在 subshell 里）。
+# 追加而非覆盖：一轮里主腿失败、降级腿又失败时保留完整链条，读的人取末行。
+_error_sample_record() {
+    [[ -n "${SPARRING_ERROR_SAMPLE_FILE:-}" ]] || return 0
+    printf '%s\n' "$1" >> "$SPARRING_ERROR_SAMPLE_FILE" 2>/dev/null || true
+}
+
 # ─── Reviewer 角色 prompt ────────────────────────────────────
 # 两个后端共用。裁决格式是硬契约（上层按首列 APPROVE/CONCERNS 定退出码），
 # 改这段等于改 sparring 的对外行为。
@@ -987,7 +1072,10 @@ AGENT_STDIN=""
 _agent_cmd_claude() {
     local model="$1"
     AGENT_CMD=(claude -p)
-    if [[ "$_RV_MODE" == "range" ]]; then
+    if [[ "$_RV_MODE" == "range" && "$(_config_get claude.range_mode)" != "native" ]]; then
+        # 统一模式：方法论 + range 指令 + 裁决契约全部经 stdin 喂给 claude -p，与 opencode 腿同一套解析
+        AGENT_STDIN="${2:-}"
+    elif [[ "$_RV_MODE" == "range" ]]; then
         # 走 Claude Code 原生 /code-review：审查方法论在引擎里，我们只负责给
         # level + range + 附加指令。level 之后的文本会被当成附加审查指令传下去。
         local slash="/code-review ${_RV_LEVEL} ${_RV_RANGE}"
@@ -1004,6 +1092,10 @@ _agent_cmd_claude() {
     fi
     AGENT_CMD+=(--output-format text)
     [[ -n "$model" ]] && AGENT_CMD+=(--model "$model")
+    # claude.settings：可选，指向 cc-switch 导出的 settings 文件（如 公司 Model / DeepSeek），
+    # 让 claude 腿走指定 provider 而不是个人账号额度（owner 2026-09-16：sparring 可用 claude code + settings 作异源 fallback）。
+    local settings; settings=$(_config_get claude.settings)
+    [[ -n "$settings" && -f "$settings" ]] && AGENT_CMD+=(--settings "$settings")
     # Bash 必须显式预批：-p 是非交互的，没预批的工具会被直接拒（不是挂起等人点同意），
     # reviewer 跑不了 git diff 就只能盲审。实测这套只读白名单足够跑通 /code-review，
     # 不需要 --dangerously-skip-permissions。
@@ -1181,7 +1273,12 @@ _call_backend() {
 
     # 喂给后端的输入：range 模式下 claude 拿附加指令、opencode 拿完整方法论 + 指令。
     local payload="$prompt"
-    if [[ "$_RV_MODE" == "range" && "$backend" == "opencode" ]]; then
+    # claude 腿在 range 模式默认也走注入方法论 + 统一裁决契约（config claude.range_mode=native 可切回
+    # 原生 /code-review）。2026-09-16：Claude Code 更新后 /code-review 输出改成"single-pass inline review…"
+    # 叙述，_normalize_code_review_output 解析不出 ⇒ 兜底腿整夜 ERROR(parse)，评审腿再次单点。
+    local claude_unified=false
+    if [[ "$backend" == "claude" && "$(_config_get claude.range_mode)" != "native" ]]; then claude_unified=true; fi
+    if [[ "$_RV_MODE" == "range" && ( "$backend" == "opencode" || "$claude_unified" == "true" ) ]]; then
         local methodology
         if ! methodology=$(_adversarial_prompt); then
             [[ -n "$ephemeral_cwd" ]] && rm -rf "$ephemeral_cwd"
@@ -1260,8 +1357,13 @@ _call_backend() {
     _heartbeat_stop
 
     if [[ "$ok" != true ]]; then
-        local err_output
+        local err_output _why _sample
         err_output=$(tail -c 400 "$log_file" 2>/dev/null || true)
+        # 失败留样必须赶在 eval "$_cleanup" 删掉临时文件之前写
+        _why="crash"
+        [[ $last_rc -eq 124 ]] && _why="timeout"
+        _sample=$(_error_sample_write "$_why" "$backend" "$last_rc" "$output_file" "$log_file")
+        [[ -n "$_sample" ]] && _error_sample_record "$_sample"
         eval "$_cleanup"
         if [[ $last_rc -eq 124 ]]; then
             _error_reason_record timeout
@@ -1276,6 +1378,13 @@ _call_backend() {
 
     local result
     result=$(_strip_agent_noise < "$output_file")
+    # 返回空也要留证（#2919）：stdout 没内容，有价值的是 stderr——进程为什么闭嘴。
+    # 同样赶在清理临时文件之前。
+    if [[ "$result" != *[![:space:]]* ]]; then
+        local _empty_sample
+        _empty_sample=$(_error_sample_write empty "$backend" 0 "$output_file" "$log_file")
+        [[ -n "$_empty_sample" ]] && _error_sample_record "$_empty_sample"
+    fi
     eval "$_cleanup"
 
     if [[ "$result" != *[![:space:]]* ]]; then
@@ -1285,10 +1394,18 @@ _call_backend() {
     fi
 
     # claude 的 range 审查走原生 /code-review，输出格式跟统一契约不同，这里翻译
-    if [[ "$backend" == "claude" && "$_RV_MODE" == "range" ]]; then
+    if [[ "$backend" == "claude" && "$_RV_MODE" == "range" && "$(_config_get claude.range_mode)" == "native" ]]; then
         local normalized
         if ! normalized=$(_normalize_code_review_output "$result" "$_RV_LEVEL"); then
             _error_reason_record parse
+            local _parse_tmp _parse_sample
+            _parse_tmp=$(mktemp "${TMPDIR:-/tmp}/sparring-sample.XXXXXX" 2>/dev/null) || _parse_tmp=""
+            if [[ -n "$_parse_tmp" ]]; then
+                printf '%s' "$result" > "$_parse_tmp" 2>/dev/null || true
+                _parse_sample=$(_error_sample_write parse "$backend" 0 "$_parse_tmp" "")
+                [[ -n "$_parse_sample" ]] && _error_sample_record "$_parse_sample"
+                rm -f "$_parse_tmp" 2>/dev/null || true
+            fi
             echo -e "${RED}错误: 无法解析 claude /code-review 的输出${NC}" >&2
             echo -e "${DIM}  原始输出前 200 字符: ${result:0:200}${NC}" >&2
             return 1
@@ -1307,12 +1424,44 @@ call_reviewer() {
     primary=$(get_review_backend) || return 1
     fallback=$(get_review_backend_fallback) || return 1
 
+    # 本轮起点：_review_run 会提前设好（含快照创建之后的全部耗时），
+    # task 制调用方没设时以本函数入口为起点。
+    local _round_t0="${SPARRING_ROUND_T0:-}"
+    [[ -n "$_round_t0" ]] || _round_t0=$(date +%s)
+
     local result rc=0
     result=$(_call_backend "$primary" "$prompt" "$run_cwd") || rc=$?
     if [[ $rc -eq 0 ]]; then
         _reviewer_state_record "$primary" primary
         echo "$result"
         return 0
+    fi
+
+    # empty 早退重试（#2919）：主腿返回空、本轮 <120s、且退出码是 1（腿自己的失败）
+    # 时，重试一次主腿再走降级链。读数依据：jsonl 里 empty 的耗时是两簇——
+    # 15–91s 的早退 vs 161–431s 的"跑完没吐"，只有前者值得重试，后者重试等于
+    # 原样再烧一遍。退出码 143/137/130 是被信号打进进程组（外部打断，不是腿的行为），
+    # 一律不重试。不改变降级语义：重试仍失败照样降级，只是多了这一次尝试。
+    # 判据取自原因文件（每次失败由 _call_backend 写入）：ad-hoc 路径由 _review_run 设它；
+    # task/worker 制那两条 call_reviewer 调用方不设，也就不会触发这次重试
+    # ——那边的失败原因本来也不落 JSONL，口径保持跟读数面一致。
+    local _fail_reason=""
+    if [[ -n "${SPARRING_ERROR_REASON_FILE:-}" && -s "$SPARRING_ERROR_REASON_FILE" ]]; then
+        _fail_reason=$(tr -d '\n' < "$SPARRING_ERROR_REASON_FILE" 2>/dev/null) || _fail_reason=""
+    fi
+    local _round_elapsed=$(( $(date +%s) - _round_t0 ))
+    if [[ $rc -eq 1 && "$_fail_reason" == "empty" && $_round_elapsed -lt 120 ]]; then
+        echo -e "${DIM}  主腿返回空、本轮 ${_round_elapsed}s（<120s）：重试一次主腿${NC}" >&2
+        # 必须用新变量收退出码：`|| rc=$?` 只在失败时赋值，直接复用 rc 会把上一次的
+        # 失败码带进下面「重试是否成功」的判断（成功也会当成失败去降级）。
+        local _retry_rc=0
+        result=$(_call_backend "$primary" "$prompt" "$run_cwd") || _retry_rc=$?
+        if [[ $_retry_rc -eq 0 ]]; then
+            _reviewer_state_record "$primary" primary
+            echo "$result"
+            return 0
+        fi
+        rc=$_retry_rc
     fi
 
     if [[ -z "$fallback" ]]; then
@@ -1446,13 +1595,18 @@ _review_log_retention_days() {
     printf '%s' "$days"
 }
 
-# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via> [mode] [range] [level] [error_reason]
+# _review_log_append <exit_code> <verdict> <title> <input_lines> <duration_s> <backend> <via> [mode] [range] [level] [error_reason] [error_sample]
 # mode: range（审 git range）| text（审一段文本）；range 字段无则 null。
 # error_reason: timeout|crash|empty|parse，只在 verdict=ERROR 时有值——排查"静默挂了"
 # 的第一手依据，没有它只能看到一个 exit 1。
+# error_sample: 失败留样文件路径（腿的原始输出前 4KB，脱敏后），无留样时 null。
+# 降级后成功轮也可能有值——那指向被降级吸收掉的那次失败。
 _review_log_append() {
     local exit_code="$1" verdict="$2" title="$3" input_lines="$4" duration_s="$5" backend="$6" via="$7"
-    local mode="${8:-text}" range="${9:-}" level="${10:-}" error_reason="${11:-}"
+    local mode="${8:-text}" range="${9:-}" level="${10:-}" error_reason="${11:-}" error_sample="${12:-}"
+    # 来源一行随裁决打到 stderr：读结论的人不用翻 JSONL 就知道这轮是主腿还是兜底腿出的
+    # （2026-09-16：一次静默降级被误读成「占个人额度」，根因是来源只在日志里）。
+    echo -e "${DIM}[sparring] source: backend=${backend} via=${via} verdict=${verdict}${error_reason:+ error=${error_reason}}${NC}" >&2
     local days
     days=$(_review_log_retention_days)
     [[ "$days" == "0" ]] && return 0
@@ -1461,6 +1615,7 @@ _review_log_append() {
     mkdir -p "$dir" 2>/dev/null || return 0
     # 写入顺带清理过期日志；按文件 mtime 判断，删整文件比按行过滤简单且无半写风险
     find "$dir" -maxdepth 1 -name 'review-*.jsonl' -type f -mtime +"$days" -delete 2>/dev/null || true
+    _error_sample_cleanup "$days"   # 失败留样同一保留天数（挂在这里 = 每轮都跑）
     # 数字字段兜底成合法 JSON，避免上游异常值让 jq 报错丢日志
     [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
     [[ "$input_lines" =~ ^[0-9]+$ ]] || input_lines=0
@@ -1475,6 +1630,7 @@ _review_log_append() {
         --arg range "$range" \
         --arg level "$level" \
         --arg error_reason "$error_reason" \
+        --arg error_sample "$error_sample" \
         --argjson input_lines "$input_lines" \
         --argjson duration_s "$duration_s" \
         --argjson exit_code "$exit_code" \
@@ -1482,7 +1638,8 @@ _review_log_append() {
           level: (if $level == "" then null else $level end),
           input_lines: $input_lines, backend: $backend,
           via: $via, duration_s: $duration_s, exit_code: $exit_code, verdict: $verdict,
-          error_reason: (if $error_reason == "" then null else $error_reason end)}' \
+          error_reason: (if $error_reason == "" then null else $error_reason end),
+          error_sample: (if $error_sample == "" then null else $error_sample end)}' \
         >> "${dir}/review-$(date +%Y%m%d).jsonl" 2>/dev/null || true
 }
 
@@ -1493,17 +1650,21 @@ _review_run() {
 
     # 执行日志采集：起始时间 + 实际后端状态文件 + 失败原因文件
     # （call_reviewer 在命令替换 subshell 里跑，靠文件把 backend/via/reason 传回来）
-    local _log_t0 _log_state _log_reason_file
+    local _log_t0 _log_state _log_reason_file _log_sample_file
     _log_t0=$(date +%s)
+    # 本轮起点给 call_reviewer 用（empty 早退重试的 <120s 判据按它算）
+    SPARRING_ROUND_T0="$_log_t0"
     _log_state=$(mktemp "${TMPDIR:-/tmp}/sparring-review-state.XXXXXX" 2>/dev/null) || _log_state=""
     [[ -n "$_log_state" ]] && SPARRING_BACKEND_STATE_FILE="$_log_state"
     _log_reason_file=$(mktemp "${TMPDIR:-/tmp}/sparring-review-reason.XXXXXX" 2>/dev/null) || _log_reason_file=""
     [[ -n "$_log_reason_file" ]] && SPARRING_ERROR_REASON_FILE="$_log_reason_file"
+    _log_sample_file=$(mktemp "${TMPDIR:-/tmp}/sparring-review-sample.XXXXXX" 2>/dev/null) || _log_sample_file=""
+    [[ -n "$_log_sample_file" ]] && SPARRING_ERROR_SAMPLE_FILE="$_log_sample_file"
 
     local result rc=0
     result=$(call_reviewer "$prompt" "$run_cwd") || rc=$?
 
-    local _log_backend="" _log_via="" _log_dur _log_reason=""
+    local _log_backend="" _log_via="" _log_dur _log_reason="" _log_sample=""
     if [[ -n "$_log_state" && -s "$_log_state" ]]; then
         # 状态文件是尝试链（每行一次尝试），末行 = 最终实际使用的后端
         read -r _log_backend _log_via <<< "$(tail -n 1 "$_log_state" 2>/dev/null)" || true
@@ -1511,9 +1672,14 @@ _review_run() {
     if [[ -n "$_log_reason_file" && -s "$_log_reason_file" ]]; then
         _log_reason=$(tr -d '\n' < "$_log_reason_file" 2>/dev/null) || _log_reason=""
     fi
+    # 留样链同取末行（最后一次失败的那份）；降级后成功轮也有留样，指回被吸收的失败
+    if [[ -n "$_log_sample_file" && -s "$_log_sample_file" ]]; then
+        _log_sample=$(tail -n 1 "$_log_sample_file" 2>/dev/null) || _log_sample=""
+    fi
     [[ -n "$_log_state" ]] && rm -f "$_log_state" 2>/dev/null
     [[ -n "$_log_reason_file" ]] && rm -f "$_log_reason_file" 2>/dev/null
-    unset SPARRING_BACKEND_STATE_FILE SPARRING_ERROR_REASON_FILE
+    [[ -n "$_log_sample_file" ]] && rm -f "$_log_sample_file" 2>/dev/null
+    unset SPARRING_BACKEND_STATE_FILE SPARRING_ERROR_REASON_FILE SPARRING_ERROR_SAMPLE_FILE SPARRING_ROUND_T0
     _log_dur=$(( $(date +%s) - _log_t0 ))
 
     if [[ $rc -ne 0 ]]; then
@@ -1521,7 +1687,7 @@ _review_run() {
         [[ -z "$_log_reason" ]] && _log_reason="crash"
         echo -e "${RED}✗ review 未完成，原因: ${_log_reason}${NC}" >&2
         _review_log_append "$rc" ERROR "$title" "$input_lines" "$_log_dur" \
-            "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" "$_log_reason"
+            "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" "$_log_reason" "$_log_sample"
         return $rc
     fi
 
@@ -1533,18 +1699,27 @@ _review_run() {
     case "$verdict" in
         APPROVE)
             _review_log_append 0 APPROVE "$title" "$input_lines" "$_log_dur" \
-                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" ""
+                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" "" "$_log_sample"
             return 0
             ;;
         CONCERNS)
             _review_log_append 2 CONCERNS "$title" "$input_lines" "$_log_dur" \
-                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" ""
+                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" "" "$_log_sample"
             return 2
             ;;
         *)
             echo -e "${YELLOW}⚠ 无法从 reviewer 输出解析出 APPROVE/CONCERNS 裁决，按调用错误处理（exit 1）${NC}" >&2
+            # 解析失败也要留证（#2919）：$result 就是腿的原始输出，是 parse 类唯一的现场
+            local _parse_tmp _parse_sample=""
+            _parse_tmp=$(mktemp "${TMPDIR:-/tmp}/sparring-sample.XXXXXX" 2>/dev/null) || _parse_tmp=""
+            if [[ -n "$_parse_tmp" ]]; then
+                printf '%s' "$result" > "$_parse_tmp" 2>/dev/null || true
+                _parse_sample=$(_error_sample_write parse "${_log_backend:-unknown}" 0 "$_parse_tmp" "")
+                rm -f "$_parse_tmp" 2>/dev/null || true
+            fi
+            [[ -n "$_parse_sample" ]] || _parse_sample="$_log_sample"
             _review_log_append 1 ERROR "$title" "$input_lines" "$_log_dur" \
-                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" parse
+                "$_log_backend" "$_log_via" "$mode" "$range" "$_RV_LEVEL" parse "$_parse_sample"
             return 1
             ;;
     esac
@@ -1667,12 +1842,16 @@ review_adhoc() {
 进程管理（每次 review 只有三种结局，不存在静默挂死）:
   APPROVE / CONCERNS / 带原因的 ERROR（timeout|crash|empty|parse）
   超时（config review.timeout，默认 1800s）杀掉整个进程组，不留孤儿进程；
+  主腿返回空且本轮 <120s 时，重试一次主腿再走降级链（被信号打断的不重试）；
   运行期间每 15s 往 stderr 打一行心跳。
 
 执行日志（排查超时/降级用）:
   每次调用追加一行 JSONL 到 ~/.local/state/sparring/review-YYYYMMDD.jsonl
   （字段: ts/title/mode/range/level/input_lines/backend/via/duration_s/exit_code/
-   verdict/error_reason），默认保留 7 天（config: review.log_retention_days，0 = 禁用）。
+   verdict/error_reason/error_sample），默认保留 7 天（config: review.log_retention_days，0 = 禁用）。
+  失败留样: 腿的 stdout/stderr 各前 4KB（连接串/token 形态已脱敏）落在
+  ~/.local/state/sparring/errors/<ts>-<原因>.txt，JSONL 的 error_sample 指向它
+  （降级后成功的轮次也可能有——那指向被降级吸收掉的那次失败）。
 
 示例:
   sparring review --range origin/main...HEAD
@@ -1687,6 +1866,15 @@ USAGE
                 ;;
         esac
     done
+
+    # --title 缺省时 range 模式自动补「分支@短sha」，否则 JSONL 里 title 为空串、
+    # 事后无法归属是谁的轮次（2026-09-16 四个话题会话同时漏传，lead 核门时全部 grep 不到）。
+    if [[ -z "$title" && -n "$range" ]]; then
+        local _br _sha
+        _br=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+        _sha=$(git rev-parse --short HEAD 2>/dev/null || echo "?")
+        title="${_br}@${_sha} (auto-title)"
+    fi
 
     # range 模式一律不读 stdin。非交互环境（CI / agent 子进程）里 stdin 常是个
     # 永远不关闭的管道，`cat` 会一直阻塞 —— 实测 `sparring review --range X` 直接卡死。

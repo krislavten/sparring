@@ -579,7 +579,9 @@ test_call_backend_empty_output_fails() {
     mkdir -p "$dir"
     printf '#!/bin/bash\ncat > /dev/null\nexit 0\n' > "$dir/claude"
     chmod +x "$dir/claude"
-    PATH="$dir:$PATH" _call_backend claude "p" "$TMP_DIR" >/dev/null 2>&1 || status=$?
+    # XDG_STATE_HOME 隔离：失败留样会落盘，不能写进跑测试的人的 ~/.local/state
+    PATH="$dir:$PATH" XDG_STATE_HOME="$TMP_DIR/state-empty-out" \
+        _call_backend claude "p" "$TMP_DIR" >/dev/null 2>&1 || status=$?
     assert_eq "后端返回空 → 当调用错误" "1" "$status"
 }
 test_call_backend_empty_output_fails
@@ -2107,8 +2109,199 @@ test_review_log_level_and_reason_fields() {
     XDG_STATE_HOME="$state_dir" _review_log_append 0 APPROVE "审文本" 5 3 opencode primary text "" "" ""
     line=$(tail -1 "$state_dir/sparring/review-$(date +%Y%m%d).jsonl")
     assert_eq "text 模式 level 为 null" "null" "$(echo "$line" | jq -r '.level')"
+    assert_eq "无留样时 error_sample 为 null" "null" "$(echo "$line" | jq -r '.error_sample')"
 }
 test_review_log_level_and_reason_fields
+
+echo ""
+echo "=== 失败留样 & empty 早退重试（#2919） ==="
+
+# 假腿：把调用次数写到 $LEG_COUNT_FILE（文件而非变量——call_reviewer 跑在 $(...) 里，
+# 变量改动传不出来），行为由 $LEG_MODE 选。stdin 必须读掉，不然写端可能收到 SIGPIPE。
+_make_fake_leg() {
+    local dir="$1" name="$2"
+    mkdir -p "$dir"
+    cat > "$dir/$name" <<'LEG'
+#!/bin/bash
+cat > /dev/null
+n=0
+[[ -f "$LEG_COUNT_FILE" ]] && n=$(cat "$LEG_COUNT_FILE")
+echo $(( n + 1 )) > "$LEG_COUNT_FILE"
+case "${LEG_MODE:-empty}" in
+    empty)        exit 0 ;;
+    empty-then-ok) [[ $(( n + 1 )) -ge 2 ]] && { echo "APPROVE"; exit 0; }; exit 0 ;;
+    exit143)      exit 143 ;;
+    parse)        echo "看完了，整体不错，但有几点想法。"; exit 0 ;;
+esac
+LEG
+    chmod +x "$dir/$name"
+    printf '%s' "$dir"
+}
+
+test_call_backend_empty_writes_sample() {
+    source_workflow_funcs
+    local dir state reason_f sample_f status=0
+    dir=$(_make_fake_leg "$TMP_DIR/leg-empty" opencode)
+    state="$TMP_DIR/state-empty"; mkdir -p "$state"
+    reason_f="$TMP_DIR/reason-empty.txt"; sample_f="$TMP_DIR/sample-empty.txt"
+    LEG_COUNT_FILE="$TMP_DIR/count-empty" LEG_MODE=empty \
+        PATH="$dir:$PATH" XDG_STATE_HOME="$state" \
+        SPARRING_ERROR_REASON_FILE="$reason_f" SPARRING_ERROR_SAMPLE_FILE="$sample_f" \
+        _call_backend opencode "p" "$TMP_DIR" >/dev/null 2>&1 || status=$?
+
+    assert_eq "空输出 → 调用失败" "1" "$status"
+    assert_eq "原因记 empty" "empty" "$(cat "$reason_f" 2>/dev/null)"
+    local sample
+    sample=$(cat "$sample_f" 2>/dev/null)
+    assert_contains "留样路径回传（取的是文件不是变量）" "errors/" "$sample"
+    local body
+    body=$(cat "$sample" 2>/dev/null)
+    assert_contains "留样有头部元信息" "reason: empty" "$body"
+    assert_contains "留样有 stdout 段" "stdout ---" "$body"
+    # empty 的现场在 stderr（进程为什么闭嘴），这一段必须在
+    assert_contains "留样有 stderr 段" "stderr ---" "$body"
+}
+test_call_backend_empty_writes_sample
+
+test_error_sample_redacts_secrets() {
+    source_workflow_funcs
+    local state tmp out body
+    state="$TMP_DIR/state-redact"; mkdir -p "$state"
+    tmp="$TMP_DIR/raw-out.txt"
+    # 种子运行时拼接：源码里不出现连续可匹配串，免得这份测试自己造出"泄露命中"
+    local fake_key="sk-""EXAMPLE""FAKE""FAKE""0123456789"
+    printf 'clean line stays\nuse key %s now\n' "$fake_key" > "$tmp"
+
+    out=$(XDG_STATE_HOME="$state" _error_sample_write parse opencode 0 "$tmp" "")
+    body=$(cat "$out" 2>/dev/null)
+    assert_contains "阴性对照：普通行原样保留" "clean line stays" "$body"
+    assert_not_contains "token 形态被替换掉" "$fake_key" "$body"
+    assert_contains "替换成 <redacted>" "<redacted>" "$body"
+    assert_contains "落在 errors/ 目录" "errors/" "$out"
+}
+test_error_sample_redacts_secrets
+
+test_error_sample_caps_each_section() {
+    source_workflow_funcs
+    local state tmp out size
+    state="$TMP_DIR/state-cap"; mkdir -p "$state"
+    tmp="$TMP_DIR/raw-big.txt"
+    local line100
+    line100=$(printf 'x%.0s' $(seq 1 100))
+    for _ in $(seq 1 100); do printf '%s\n' "$line100"; done > "$tmp"   # 10KB 输出
+    out=$(XDG_STATE_HOME="$state" _error_sample_write crash opencode 1 "$tmp" "")
+    size=$(wc -c < "$out" | tr -d ' ')
+    # 段限 4096：10KB 输入下整份留样应落在 4KB 附近（头部 + 两个段界 + 截断后的段）
+    assert_eq "stdout 段被截断（整份 < 4.6KB）" "0" "$(( size > 4600 ))"
+    assert_eq "截断后仍有内容（> 4KB 输入留了一段）" "0" "$(( size < 4000 ))"
+}
+test_error_sample_caps_each_section
+
+test_error_sample_retention() {
+    source_workflow_funcs
+    local state="$TMP_DIR/state-retention"
+    mkdir -p "$state/sparring/errors"
+    : > "$state/sparring/errors/old-empty.txt"
+    : > "$state/sparring/errors/fresh-empty.txt"
+    touch -t 202001010000 "$state/sparring/errors/old-empty.txt"   # 保留 7 天，这份是 2020 年的
+    XDG_STATE_HOME="$state" _error_sample_cleanup 7
+    assert_eq "过期留样被回收" "fresh-empty.txt" "$(ls "$state/sparring/errors" | tr '\n' ' ' | sed 's/ $//')"
+
+    # 只在"写留样时"清理不够：正常轮（不写留样）也得回收，否则安静期旧留样永不删
+    : > "$state/sparring/errors/old-crash.txt"
+    touch -t 202001010000 "$state/sparring/errors/old-crash.txt"
+    XDG_STATE_HOME="$state" _review_log_append 0 APPROVE "t" 1 1 opencode primary text "" "" "" ""
+    assert_eq "正常轮顺带回收过期留样" "0" "$([[ -e "$state/sparring/errors/old-crash.txt" ]] && echo 1 || echo 0)"
+}
+test_error_sample_retention
+
+test_call_reviewer_retries_short_empty() {
+    source_workflow_funcs
+    local count_f="$TMP_DIR/count-retry.txt"
+    _call_backend() {
+        local n=0
+        [[ -f "$count_f" ]] && n=$(cat "$count_f")
+        echo $(( n + 1 )) > "$count_f"
+        if [[ $(( n + 1 )) -eq 1 ]]; then
+            _error_reason_record empty
+            return 1
+        fi
+        echo "APPROVE"
+        return 0
+    }
+    local result
+    result=$(SPARRING_ERROR_REASON_FILE="$TMP_DIR/r-retry.txt" \
+        WORKFLOW_REVIEW_BACKEND=claude WORKFLOW_REVIEW_BACKEND_FALLBACK=claude \
+        call_reviewer "p" "" 2>/dev/null)
+    assert_eq "短 empty 重试一次后成功" "APPROVE" "$result"
+    assert_eq "主腿被调了 2 次（重试发生在降级之前）" "2" "$(cat "$count_f" 2>/dev/null)"
+}
+test_call_reviewer_retries_short_empty
+
+test_call_reviewer_no_retry_when_slow() {
+    source_workflow_funcs
+    local count_f="$TMP_DIR/count-slow.txt"
+    _call_backend() {
+        local n=0
+        [[ -f "$count_f" ]] && n=$(cat "$count_f")
+        echo $(( n + 1 )) > "$count_f"
+        _error_reason_record empty
+        return 1
+    }
+    local status=0
+    # 本轮已跑了 200s（>120s）：跑完没吐的那一类，重试等于原样再烧一遍
+    SPARRING_ROUND_T0=$(( $(date +%s) - 200 )) SPARRING_ERROR_REASON_FILE="$TMP_DIR/r-slow.txt" \
+        WORKFLOW_REVIEW_BACKEND=claude WORKFLOW_REVIEW_BACKEND_FALLBACK=claude \
+        call_reviewer "p" "" >/dev/null 2>&1 || status=$?
+    assert_eq "慢 empty 不重试，直接失败" "1" "$status"
+    assert_eq "主腿只被调了 1 次" "1" "$(cat "$count_f" 2>/dev/null)"
+}
+test_call_reviewer_no_retry_when_slow
+
+test_call_reviewer_no_retry_on_signal_exit() {
+    source_workflow_funcs
+    local count_f="$TMP_DIR/count-143.txt"
+    _call_backend() {
+        local n=0
+        [[ -f "$count_f" ]] && n=$(cat "$count_f")
+        echo $(( n + 1 )) > "$count_f"
+        _error_reason_record empty
+        return 143
+    }
+    local status=0
+    # 143 = 进程被信号打断（外部 kill / 进程组被收），不是腿自己的行为，重试没有意义
+    SPARRING_ERROR_REASON_FILE="$TMP_DIR/r-143.txt" \
+        WORKFLOW_REVIEW_BACKEND=claude WORKFLOW_REVIEW_BACKEND_FALLBACK=claude \
+        call_reviewer "p" "" >/dev/null 2>&1 || status=$?
+    assert_eq "退出码 143 原样上报" "143" "$status"
+    assert_eq "被信号打断的主腿不重试" "1" "$(cat "$count_f" 2>/dev/null)"
+}
+test_call_reviewer_no_retry_on_signal_exit
+
+test_review_run_parse_writes_sample() {
+    source_workflow_funcs
+    local state="$TMP_DIR/state-parse-run"
+    mkdir -p "$state"
+    call_reviewer() { printf '看完了，整体不错，但有几点想法。\n'; }
+    local status=0
+    XDG_STATE_HOME="$state" _review_run "p" "" "t" text "" 1 >/dev/null 2>&1 || status=$?
+
+    assert_eq "解析不出裁决 → exit 1" "1" "$status"
+    local line sp
+    line=$(tail -1 "$state/sparring/review-$(date +%Y%m%d).jsonl")
+    assert_eq "verdict=ERROR" "ERROR" "$(echo "$line" | jq -r '.verdict')"
+    assert_eq "reason=parse" "parse" "$(echo "$line" | jq -r '.error_reason')"
+    sp=$(echo "$line" | jq -r '.error_sample')
+    assert_contains "error_sample 指向留样" "errors/" "$sp"
+    assert_contains "留样里是腿的原始输出" "整体不错" "$(cat "$sp" 2>/dev/null)"
+
+    # 阳性对照：同一路径下正常裁决的轮次 error_sample 必须是 null（不是恒有值）
+    call_reviewer() { printf 'APPROVE\n\n没问题\n'; }
+    XDG_STATE_HOME="$state" _review_run "p" "" "t" text "" 1 >/dev/null 2>&1
+    line=$(tail -1 "$state/sparring/review-$(date +%Y%m%d).jsonl")
+    assert_eq "正常轮 error_sample 为 null" "null" "$(echo "$line" | jq -r '.error_sample')"
+}
+test_review_run_parse_writes_sample
 
 echo ""
 echo "=== 背景 job 死 PID 改判 ==="

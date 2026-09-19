@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### 新增
+
+- **失败留样**：`verdict=ERROR` 的轮次把腿的 stdout/stderr 各前 4KB（连接串/token 形态脱敏后）留一份到 `~/.local/state/sparring/errors/<ts>-<原因>.txt`，JSONL 新增 `error_sample` 字段指向它（降级后成功的轮次也可能有值——指回被降级吸收掉的那次失败）。此前失败只留一个原因码，`empty`/`parse` 的原始输出看完即弃，事后无从归因；留样与 JSONL 同生命周期（`review.log_retention_days`，`0` = 同样禁用）。
+- **`empty` 早退重试**：主腿返回空、本轮耗时 <120s、且退出码为 1（腿自己的失败）时，重试一次主腿再走降级链。退出码 143/137/130（被信号打断）与耗时 ≥120s 的"跑完没吐"都不重试。降级语义不变：重试仍失败照样降级，只是多了这一次尝试。
+
 ## 3.0.0 (2026-08-12)
 
 **Breaking。** review 从「调用方把 diff 文本管道进来、单发给模型」改成「reviewer 是个 agent，自己进仓库查」。旧的 `git diff ... | sparring review` 用法会直接报错，旧配置里的 backend 值也会被拒绝，需要按下面改。
