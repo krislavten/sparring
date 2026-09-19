@@ -1176,7 +1176,14 @@ test_help_no_raw_ansi_literal() {
     local raw_count
     raw_count=$(grep -c '\\033' "$out_file")
     [[ -z "$raw_count" ]] && raw_count=0
-    set -e 2>/dev/null || true
+    # ⚠ 这里必须恢复成 `set +e`，不是 `set -e`（2026-09-19 修）：
+    # 本套件顶上是 `set -uo pipefail`，**errexit 从来没开过**。写 `set -e` 不是"恢复"，
+    # 是**打开**它，而且是对其后一千多行全局打开。后果在很远处才爆：
+    # 「背景 job 死 PID 改判」那节里 `wait <被 kill 的 pid>` 正常返回 143，errexit 一开
+    # 就整个脚本退出 ⇒ 其后两节（opencode 网关认证注入、对抗式 review 方法论）从不执行，
+    # 末尾的 `Results: N passed, M failed` 与 `[[ $FAIL -eq 0 ]] && exit 0 || exit 1` 也从不执行
+    # ⇒ **这个套件的通过/失败门整整死了一段时间，跑的人只看到一屏 ✓ 然后没有结论。**
+    set +e
     assert_eq "help 输出无字面 \\\\033" "0" "$raw_count"
 
     # 真 ESC 字节（0x1b）应存在
@@ -2181,21 +2188,49 @@ test_error_sample_redacts_secrets() {
 }
 test_error_sample_redacts_secrets
 
+# 段限与切片形态。**断言一律相对 `_ERROR_SAMPLE_MAX_BYTES` 写，不写死字节数**——
+# 2026-09-19 这条测试就是因为把 4096 写死成「< 4.6KB」，在上限抬到 64KB 时红了一次；
+# 写死的那版测的是"当时那个数"，不是"截断这件事"。
 test_error_sample_caps_each_section() {
     source_workflow_funcs
-    local state tmp out size
+    local state tmp out size body max slack
     state="$TMP_DIR/state-cap"; mkdir -p "$state"
+    max="$_ERROR_SAMPLE_MAX_BYTES"
+    slack=2048          # 头部元信息 + 两个段界 + 省略行
     tmp="$TMP_DIR/raw-big.txt"
-    local line100
-    line100=$(printf 'x%.0s' $(seq 1 100))
-    for _ in $(seq 1 100); do printf '%s\n' "$line100"; done > "$tmp"   # 10KB 输出
+    # 源 = 上限的 3 倍，首尾各埋一个唯一标记：**头尾都要能在留样里找到**。
+    { printf 'HEADMARKER_ONLY_AT_START\n'
+      head -c "$(( max * 3 ))" /dev/zero | tr '\0' 'x'
+      printf '\nTAILMARKER_ONLY_AT_END\n'; } > "$tmp"
     out=$(XDG_STATE_HOME="$state" _error_sample_write crash opencode 1 "$tmp" "")
-    size=$(wc -c < "$out" | tr -d ' ')
-    # 段限 4096：10KB 输入下整份留样应落在 4KB 附近（头部 + 两个段界 + 截断后的段）
-    assert_eq "stdout 段被截断（整份 < 4.6KB）" "0" "$(( size > 4600 ))"
-    assert_eq "截断后仍有内容（> 4KB 输入留了一段）" "0" "$(( size < 4000 ))"
+    size=$(wc -c < "$out" | tr -d '[:space:]')
+    assert_eq "整份留样不超过段限 + 余量" "0" "$(( size > max + slack ))"
+    assert_eq "截断后仍留了足量内容（≥ 段限的八成）" "0" "$(( size < max * 8 / 10 ))"
+    # 形态：头尾各留一半 —— 这三条是本次改动真正要守的东西。
+    # ⚠ 这里**直接 grep 文件、只把计数喂给断言**，不走 assert_contains（两个坑）：
+    # 那个 helper 是 `echo "$haystack" | grep -q`，haystack 有 64KB 时 grep 命中即退出，
+    # echo 吃到 SIGPIPE（`write error: Broken pipe`），在 pipefail 下把整条断言判成失败。
+    # 2026-09-19 实测过一次：标记明明在留样里，断言仍报红。
+    assert_eq "留样保住了源的开头" "1" "$(grep -c 'HEADMARKER_ONLY_AT_START' "$out" 2>/dev/null | tr -d '[:space:]')"
+    assert_eq "留样保住了源的结尾（只留头部时这条必红）" "1" "$(grep -c 'TAILMARKER_ONLY_AT_END' "$out" 2>/dev/null | tr -d '[:space:]')"
+    assert_eq "中间省略有显式标注" "1" "$(grep -c '中间省略' "$out" 2>/dev/null | tr -d '[:space:]')"
 }
 test_error_sample_caps_each_section
+
+# 阴性对照：源没超过段限时整份留、**不应出现省略标注**。
+# 没有这条的话，「省略标注」那条断言可以被一个无条件打印省略行的实现骗过。
+test_error_sample_small_input_not_elided() {
+    source_workflow_funcs
+    local state tmp out body
+    state="$TMP_DIR/state-small"; mkdir -p "$state"
+    tmp="$TMP_DIR/raw-small.txt"
+    printf 'SMALLHEAD\nonly a few bytes\nSMALLTAIL\n' > "$tmp"
+    out=$(XDG_STATE_HOME="$state" _error_sample_write crash opencode 1 "$tmp" "")
+    assert_eq "小输入：开头在" "1" "$(grep -c 'SMALLHEAD' "$out" 2>/dev/null | tr -d '[:space:]')"
+    assert_eq "小输入：结尾在" "1" "$(grep -c 'SMALLTAIL' "$out" 2>/dev/null | tr -d '[:space:]')"
+    assert_eq "小输入：不该出现省略标注" "0" "$(grep -c '中间省略' "$out" 2>/dev/null | tr -d '[:space:]')"
+}
+test_error_sample_small_input_not_elided
 
 test_error_sample_retention() {
     source_workflow_funcs
@@ -2322,7 +2357,7 @@ test_job_reap_dead_pid() {
     # 起一个进程再杀掉，拿到一个确定已死的 PID（比硬编码 PID 可靠：
     # 硬编码的号码可能被系统回收给别的进程，测试就会随机变绿）
     sleep 60 & local dead_pid=$!
-    kill "$dead_pid" 2>/dev/null; wait "$dead_pid" 2>/dev/null
+    kill "$dead_pid" 2>/dev/null; wait "$dead_pid" 2>/dev/null || true
     _write_job_json "$job" running "$dead_pid"
 
     _review_job_reap "$job" 2>/dev/null
@@ -2341,7 +2376,7 @@ test_job_reap_keeps_live_worker() {
 
     _review_job_reap "$job" 2>/dev/null
     assert_eq "worker 还活着就不动它" "running" "$(jq -r '.status' "$job")"
-    kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null
+    kill "$live_pid" 2>/dev/null; wait "$live_pid" 2>/dev/null || true
 }
 test_job_reap_keeps_live_worker
 

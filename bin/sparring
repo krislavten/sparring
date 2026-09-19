@@ -933,11 +933,16 @@ _error_reason_record() {
 
 # ─── 失败留样 ────────────────────────────────────────────────
 # verdict=ERROR 的轮次此前只留一个原因码：empty/parse 的原始输出看完即弃，
-# 失败率只能靠人工重试吸收，事后无从归因。这里把腿的 stdout/stderr 各留前 4KB 到
+# 失败率只能靠人工重试吸收，事后无从归因。这里把腿的 stdout/stderr 各留一段到
 # ${XDG_STATE_HOME:-~/.local/state}/sparring/errors/<ts>-<reason>.txt，
 # JSONL 用 error_sample 字段指回来。过期与开关跟 review.log_retention_days 一致
 # （0 = 同样禁用）；旁路性质与执行日志相同——写失败静默，绝不影响 review 本身。
-_ERROR_SAMPLE_MAX_BYTES=4096
+#
+# 2026-09-19 抬 4096 → 65536，并把切片从「只留头部」改成「头尾各留一半」（见 _sample_slice）。
+# 起因：`empty` 那类失败的形态是「模型把 git diff 读进上下文了、最终文本一条没出」，
+# 而 4KB 的头部截断恰好停在读 diff 的中途 ⇒ 留样看完只能得出「empty」这个已知结论，
+# 最有信息的尾部（它最后停在哪）永远看不到。2026-09-19 一天三份 empty 留样全卡在这个形态上。
+_ERROR_SAMPLE_MAX_BYTES=65536
 
 # 过期留样清理，跟 JSONL 同一保留天数。调用点有两处：_review_log_append（每轮都跑）
 # 与 _error_sample_write（每次写留样）——只挂在写留样上的话，之后长期无失败时
@@ -966,6 +971,27 @@ _redact_sample() {
         -e 's#([?&](api[-_]?key|key|token|access_token|apikey)=)[^&[:space:]]+#\1<redacted>#g'
 }
 
+# 留样切片（文件 → stdout）。源不超过上限就整份留；超过则**头尾各留一半**，
+# 中间显式标注省略了多少字节。只留头部会把长文本挂死那类故障的信息全丢掉——
+# 那类故障的判别信息在**尾部**（腿最后停在哪一步），头部永远是 diff 的开头。
+# 脱敏仍在截断**之前**做：反过来的话，正好跨在边界上的 token 会被截成"半截密钥"。
+# `* 8` 的预截只是给 sed 限流（超大输出不必全量过一遍），超出部分本来也进不了留样段。
+# 已知小瑕疵：按字节切可能把一个多字节 UTF-8 字符切成半个，只影响边界处一个字符的显示。
+_sample_slice() {
+    local src="$1" max="$_ERROR_SAMPLE_MAX_BYTES" size half
+    [[ -n "$src" && -f "$src" ]] || return 0
+    size=$(wc -c < "$src" 2>/dev/null | tr -d '[:space:]')
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    if [[ "$size" -le "$max" ]]; then
+        _redact_sample < "$src" 2>/dev/null | head -c "$max" || true
+        return 0
+    fi
+    half=$(( max / 2 ))
+    head -c "$(( max * 8 ))" "$src" 2>/dev/null | _redact_sample 2>/dev/null | head -c "$half" || true
+    printf '\n… [中间省略约 %s 字节——本留样头尾各留 %s 字节] …\n' "$(( size - max ))" "$half"
+    tail -c "$(( max * 8 ))" "$src" 2>/dev/null | _redact_sample 2>/dev/null | tail -c "$half" || true
+}
+
 # _error_sample_write <reason> <backend> <leg_rc> <stdout_src> [<stderr_src>]
 # stdout_src / stderr_src 是文件路径；留样路径打到 stdout，未启用或写失败输出空串。
 # 调用方必须在清理临时文件之前调它（这是留样的唯一来源）。调用之前的失败
@@ -988,18 +1014,14 @@ _error_sample_write() {
         target="${dir}/${ts}-${reason}-${i}.txt"
     fi
     {
-        printf '%s\n' "# sparring 失败留样（每段前 ${_ERROR_SAMPLE_MAX_BYTES} 字节，按形态脱敏）"
+        printf '%s\n' "# sparring 失败留样（每段至多 ${_ERROR_SAMPLE_MAX_BYTES} 字节：超长则头尾各留一半，按形态脱敏）"
         printf 'ts: %s\nreason: %s\nbackend: %s\nleg_exit_code: %s\n' \
             "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$reason" "$backend" "$leg_rc"
         [[ -n "${_RV_MODE:-}" ]] && printf 'mode: %s\nrange: %s\n' "$_RV_MODE" "${_RV_RANGE:-}"
         printf '%s\n' '--- stdout ---'
-        # 先脱敏、再按 4KB 截断：反过来的话，正好跨在 4KB 边界上的 token 会被截成"半截密钥"。
-        # 脱敏之前那个 32KB 只是给 sed 限流（超大输出不必全量过一遍），超出部分本来也进不了 4KB 段。
-        [[ -n "$out_src" && -f "$out_src" ]] && head -c "$(( _ERROR_SAMPLE_MAX_BYTES * 8 ))" "$out_src" 2>/dev/null \
-            | _redact_sample 2>/dev/null | head -c "$_ERROR_SAMPLE_MAX_BYTES" || true
+        _sample_slice "$out_src"
         printf '\n%s\n' '--- stderr ---'
-        [[ -n "$err_src" && -f "$err_src" ]] && head -c "$(( _ERROR_SAMPLE_MAX_BYTES * 8 ))" "$err_src" 2>/dev/null \
-            | _redact_sample 2>/dev/null | head -c "$_ERROR_SAMPLE_MAX_BYTES" || true
+        _sample_slice "$err_src"
         printf '\n'
     } > "$target" 2>/dev/null || { rm -f "$target" 2>/dev/null || true; return 0; }
     [[ -s "$target" ]] || { rm -f "$target" 2>/dev/null || true; return 0; }
