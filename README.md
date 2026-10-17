@@ -176,6 +176,8 @@ sparring review --range HEAD~3..HEAD
 
 因为 diff 不进 prompt，**没有体量上限，也不需要按文件分片**。
 
+`--intent "<一段话>"` / `--intent-file <路径>` 给出本次改动的意图（任务卡或 issue 的目标、验收、禁改项）。没给时依次取 range 右端 commit 作 head 的 PR 正文（`gh api`）、range 内的 commit message。reviewer 拿意图对照 diff，输出里固定有一节「过度设计 / 范围」：为假想需求加的抽象 / 开关 / 配置 / 新文件、可删的防御代码、比意图大的改动面、新机制没删掉的旧东西，每条给「建议删 / 简化成什么」。这一节的 `[SHOULD-FIX]` 不挡 APPROVE，只有 `[BLOCKER]`（超出意图且改了行为）才挡。
+
 ### 形态二：审一段结论或方案
 
 ```bash

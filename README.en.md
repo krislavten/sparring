@@ -176,6 +176,8 @@ sparring review --range HEAD~3..HEAD
 
 Since the diff never enters the prompt, there's **no size limit and nothing to shard**.
 
+`--intent "<text>"` / `--intent-file <path>` states what the change is meant to do (the task card or issue: goal, acceptance, what must not change). Without it, sparring takes the body of the PR whose head is the range's right-hand commit (`gh api`), then the commit messages in the range. The reviewer checks the diff against the intent, and the output always carries a 「过度设计 / 范围」 (over-design / scope) section: abstractions, switches, config, new files built for hypothetical needs; removable defensive code; a change surface larger than the intent; a new mechanism that left the one it replaces in place. Each item says what to delete or simplify to. `[SHOULD-FIX]` items there don't block APPROVE; only `[BLOCKER]` (goes beyond the intent and changes behavior) does.
+
 ### Shape 2: review a conclusion or a proposal
 
 ```bash

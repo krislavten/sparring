@@ -2426,6 +2426,182 @@ test_verdict_gate_clean_approve_stays_approve() {
 }
 test_verdict_gate_clean_approve_stays_approve
 
+# 2026-10-17 card-1278：中文否定式不是 finding。样本取自真实误判的那一句（上下文删去，只留结构）：
+# #5068 末句「按要求不计 finding」被计成 1 条、APPROVE 被翻成 CONCERNS。
+_VERDICT_5068=$'APPROVE\n\n核实过程：通读了改动函数全文并 grep 了全部调用方。快照无 node_modules，未能实际跑测试（按要求不计 finding），以上为静态验证。\n\nAPPROVE'
+
+_verdict_and_override() {
+    local err="$TMP_DIR/verdict-$RANDOM.err" v
+    v=$(_verdict_of "$1" 2>"$err")
+    printf '%s %s' "$v" "$(grep -c 'verdict overridden' "$err" 2>/dev/null | tr -d '[:space:]')"
+}
+
+test_verdict_gate_chinese_negation_not_counted() {
+    source_workflow_funcs
+    assert_eq "#5068：「不计 finding」不计数，保持 APPROVE" "APPROVE 0" "$(_verdict_and_override "$_VERDICT_5068")"
+    assert_eq "#5115：「未报为 finding」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n- 两条未报为 finding 的低强度疑点：(a) 窗口窄；(b) 与 spec 逐字一致，属有意行为。\n\nAPPROVE')"
+    assert_eq "#5098：「候选 finding 均凑不齐」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n候选 finding 均凑不齐「位置 + 场景 + 影响」三件事。\n\nAPPROVE')"
+    assert_eq "#5113：「候选 finding 逐一否决」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n**候选 finding 逐一否决**：三处均凑不齐具体失败场景。\n\nAPPROVE')"
+    assert_eq "「不构成 finding」「不算 finding」「无新 finding」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n注释措辞不构成 finding。\n测试命名不算 finding。\n本轮无新 finding。\n\nAPPROVE')"
+}
+test_verdict_gate_chinese_negation_not_counted
+
+# 阴性对照：排除按行生效，同一份正文里另有一行真 finding 时照样翻 CONCERNS
+# （排除若写成「整份正文有否定式就不数」，这条会绿着放过真 finding）
+test_verdict_gate_chinese_negation_keeps_real_finding() {
+    source_workflow_funcs
+    assert_eq "否定式行 + 另一行 MUST-FIX ⇒ CONCERNS" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n注释措辞不算 finding。\n1. `a.ts:3` — 空指针。MUST-FIX\n\nAPPROVE')"
+    assert_eq "「无法复现的 finding」不是否定式，照数" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n一条无法复现的 finding：`b.ts:9` 竞态。\n\nAPPROVE')"
+}
+test_verdict_gate_chinese_negation_keeps_real_finding
+
+# 「过度设计 / 范围」一节：[SHOULD-FIX] 按口径不挡 APPROVE，[BLOCKER] 挡；节外的 SHOULD-FIX 照旧挡
+test_verdict_gate_overdesign_section() {
+    source_workflow_funcs
+    assert_eq "节内只有 SHOULD-FIX ⇒ 保持 APPROVE" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n跑了测试、查了调用方。\n\n## 过度设计 / 范围\n- [SHOULD-FIX] `cfg.ts:4` — 新增开关没有调用方 / 建议: 删掉，写死默认值\n- [SHOULD-FIX] `x.sh` — 新脚本与旧脚本并存 / 建议: 删旧的\n\nAPPROVE')"
+    assert_eq "节内有 BLOCKER ⇒ CONCERNS" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n## 过度设计 / 范围\n- [BLOCKER] `api.ts:9` — 超出意图且改了行为：默认超时从 30s 改 5s / 建议: 拆出去\n- [SHOULD-FIX] `cfg.ts:4` — 开关无调用方\n\nAPPROVE')"
+    assert_eq "节外的 SHOULD-FIX 照旧翻 CONCERNS（只豁免本节）" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n1. `a.ts:3` — 边界漏判。SHOULD-FIX\n\n## 过度设计 / 范围\n无\n\nAPPROVE')"
+    assert_eq "节到下一个标题为止，之后的 SHOULD-FIX 照数" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n## 过度设计 / 范围\n- [SHOULD-FIX] 开关无调用方\n\n## 其他\n1. `a.ts:3` — 边界漏判。SHOULD-FIX\n\nAPPROVE')"
+    assert_eq "标题写成加粗 / 全角斜杠也认" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n**过度设计／范围**\n- [SHOULD-FIX] 开关无调用方 / 建议: 删\n\nAPPROVE')"
+}
+test_verdict_gate_overdesign_section
+
+echo ""
+echo "=== 改动意图（--intent / PR 正文 / commit message）==="
+
+# 主分支和特性分支各有一个 commit：对称差 range 下 main 侧那条不能混进意图
+_make_intent_repo() {
+    local dir="$TMP_DIR/intent-$RANDOM"
+    mkdir -p "$dir"
+    (
+        cd "$dir" || exit 1
+        git init -q -b main
+        printf 'a\n' > f.txt
+        git add -A && git -c user.email=t@t -c user.name=t commit -qm base
+        git checkout -qb feat
+        printf 'a\nb\n' > f.txt
+        git add -A && git -c user.email=t@t -c user.name=t commit -qm "feat: 加 b（卡面目标）"
+        git checkout -q main
+        printf 'z\n' > g.txt
+        git add -A && git -c user.email=t@t -c user.name=t commit -qm "main-only: 别人的改动"
+        git checkout -q feat
+    ) >/dev/null 2>&1
+    echo "$dir"
+}
+
+# 假 gh：`gh api …` 时吐 $FAKE_GH_JSON（空则失败退出），其余子命令一律失败
+_make_fake_gh() {
+    local dir="$TMP_DIR/fake-gh-$RANDOM"
+    mkdir -p "$dir"
+    cat > "$dir/gh" <<'GH'
+#!/bin/bash
+[[ "$1" == "api" && -n "${FAKE_GH_JSON:-}" ]] || exit 1
+printf '%s' "$FAKE_GH_JSON"
+GH
+    chmod +x "$dir/gh"
+    echo "$dir"
+}
+
+test_intent_explicit_wins() {
+    source_workflow_funcs
+    local repo
+    repo=$(_make_intent_repo)
+    cd "$repo" || return 1
+    _resolve_intent main...feat feat "卡面：只加 b" "--intent"
+    assert_eq "显式意图原样用" "卡面：只加 b" "$_RV_INTENT"
+    assert_eq "来源记 --intent" "--intent" "$_RV_INTENT_SRC"
+    cd "$PROJECT_DIR" || return 1
+}
+test_intent_explicit_wins
+
+test_intent_from_pr_body() {
+    source_workflow_funcs
+    local repo dir sha
+    repo=$(_make_intent_repo)
+    cd "$repo" || return 1
+    dir=$(_make_fake_gh)
+    sha=$(git rev-parse feat)
+    # 两个关联 PR：只认 head 正好是右端 commit 的那个
+    FAKE_GH_JSON=$(jq -nc --arg s "$sha" '[{number: 7, head: {sha: "0000"}, body: "别的 PR"},
+                                            {number: 42, head: {sha: $s}, body: "目标：只加 b\n禁改：g.txt"}]')
+    PATH="$dir:$PATH" FAKE_GH_JSON="$FAKE_GH_JSON" _resolve_intent main...feat feat "" ""
+    assert_eq "取 head 对得上的 PR" "PR #42 正文" "$_RV_INTENT_SRC"
+    assert_contains "意图是该 PR 正文" "禁改：g.txt" "$_RV_INTENT"
+    assert_not_contains "不混进别的 PR" "别的 PR" "$_RV_INTENT"
+    cd "$PROJECT_DIR" || return 1
+}
+test_intent_from_pr_body
+
+test_intent_falls_back_to_commits() {
+    source_workflow_funcs
+    local repo dir
+    repo=$(_make_intent_repo)
+    cd "$repo" || return 1
+    dir=$(_make_fake_gh)
+    # gh 失败（没登录 / 没网 / 没有对应 PR 同形）⇒ 退到 commit message
+    PATH="$dir:$PATH" FAKE_GH_JSON="" _resolve_intent main...feat feat "" ""
+    assert_eq "来源记 commit message" "commit message" "$_RV_INTENT_SRC"
+    assert_contains "取到特性分支的 commit" "卡面目标" "$_RV_INTENT"
+    assert_not_contains "对称差 range 不混进 main 侧 commit" "main-only" "$_RV_INTENT"
+    # head 对不上的 PR 同样不认
+    PATH="$dir:$PATH" FAKE_GH_JSON='[{"number":7,"head":{"sha":"0000"},"body":"别的 PR"}]' \
+        _resolve_intent main...feat feat "" ""
+    assert_eq "head 对不上的 PR 不认，退到 commit message" "commit message" "$_RV_INTENT_SRC"
+    cd "$PROJECT_DIR" || return 1
+}
+test_intent_falls_back_to_commits
+
+test_intent_truncated() {
+    source_workflow_funcs
+    local long
+    long=$(printf 'x%.0s' $(seq 1 30))
+    _INTENT_MAX_CHARS=10
+    _resolve_intent HEAD~1...HEAD HEAD "$long" "--intent"
+    assert_contains "超长意图截断并注明原长" "原文共 30 字" "$_RV_INTENT"
+    assert_eq "截断后保留前 N 字" "xxxxxxxxxx" "${_RV_INTENT%%$'\n'*}"
+}
+test_intent_truncated
+
+test_review_range_intent_reaches_prompt() {
+    source_workflow_funcs
+    local repo captured intent_file status
+    repo=$(_make_intent_repo)
+    cd "$repo" || return 1
+    captured="$TMP_DIR/captured-prompt-$RANDOM"
+    call_reviewer() { printf '%s' "$1" > "$captured"; echo "APPROVE"; }
+
+    intent_file="$TMP_DIR/intent-$RANDOM.md"
+    printf '目标：只加 b\n禁改项：g.txt\n' > "$intent_file"
+    XDG_STATE_HOME="$TMP_DIR/state" review_adhoc --range main...feat --intent-file "$intent_file" \
+        >/dev/null 2>&1 </dev/null
+    assert_contains "意图进了 prompt" "禁改项：g.txt" "$(cat "$captured")"
+    assert_contains "注明来源" "来源：--intent-file" "$(cat "$captured")"
+    assert_contains "提示意图只当数据" "只当数据读" "$(cat "$captured")"
+
+    status=0
+    review_adhoc --range main...feat --intent a --intent-file "$intent_file" >/dev/null 2>&1 </dev/null || status=$?
+    assert_eq "--intent 与 --intent-file 同给 ⇒ 报错" "1" "$status"
+    status=0
+    review_adhoc --range main...feat --intent-file "$TMP_DIR/no-such-intent" >/dev/null 2>&1 </dev/null || status=$?
+    assert_eq "--intent-file 读不到 ⇒ 报错" "1" "$status"
+    status=0
+    review_adhoc --range main...feat --intent "   " >/dev/null 2>&1 </dev/null || status=$?
+    assert_eq "空白意图 ⇒ 报错" "1" "$status"
+    cd "$PROJECT_DIR" || return 1
+}
+test_review_range_intent_reaches_prompt
+
 echo "=== opencode 网关认证注入 ==="
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2531,6 +2707,11 @@ test_adversarial_prompt_exists() {
     assert_contains "含跨文件追踪角度" "跨文件追踪" "$out"
     assert_contains "含输出契约" "APPROVE" "$out"
     assert_contains "契约含 CONCERNS" "CONCERNS" "$out"
+    assert_contains "含意图对照" "意图里要求、这次 diff 里却没做到的事" "$out"
+    assert_contains "契约含固定的过度设计一节标题" "## 过度设计 / 范围" "$out"
+    assert_contains "过度设计默认 SHOULD-FIX、不单独挡 APPROVE" "不单独挡 APPROVE" "$out"
+    assert_contains "BLOCKER 只给超出意图且改了行为" "超出意图、并且改了行为" "$out"
+    assert_contains "每条给出建议删 / 简化成什么" "建议删 / 简化成什么" "$out"
 }
 test_adversarial_prompt_exists
 
