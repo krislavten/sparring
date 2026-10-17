@@ -2494,6 +2494,11 @@ test_verdict_gate_gate_r1_fail_open_shapes() {
         "$(_verdict_and_override $'APPROVE\n\n- [BLOCKER] 迁移会丢数据 0042.sql，除此之外没有新 finding\n\nAPPROVE')"
     assert_eq "F7 散文行首是「过度设计 / 范围」不开节" "CONCERNS 1" \
         "$(_verdict_and_override $'APPROVE\n\n过度设计 / 范围这一项没有问题。\n- [SHOULD-FIX] d.ts:2 日志打印了 token 前缀\n\nAPPROVE')"
+    # sparring r2：F6 的英文孪生。英文否定式此前在标签检查之前整行删（main 上也放行）
+    assert_eq "F6 英文孪生：真 BLOCKER + 「no findings」" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n- [BLOCKER] migration drops data in 0042.sql, otherwise no findings.\n\nAPPROVE')"
+    assert_eq "不带标签的英文否定式照旧不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\nChecked all callers; no findings.\n\nAPPROVE')"
 }
 test_verdict_gate_gate_r1_fail_open_shapes
 
