@@ -2477,6 +2477,26 @@ test_verdict_gate_overdesign_section() {
 }
 test_verdict_gate_overdesign_section
 
+# gate r1（sparring#18 评论 6230197092）的 F1–F7：main 判 CONCERNS、74acda7 判 APPROVE 的放行形状，原样抄来
+test_verdict_gate_gate_r1_fail_open_shapes() {
+    source_workflow_funcs
+    assert_eq "F1 加粗标题同一行写 [BLOCKER]" "CONCERNS 1" \
+        "$(_verdict_and_override $'**过度设计 / 范围**：[BLOCKER] 超出意图改了禁改的鉴权分支 auth.ts:40\n\nAPPROVE')"
+    assert_eq "F2 ## 标题同一行写 MUST-FIX" "CONCERNS 1" \
+        "$(_verdict_and_override $'## 过度设计 / 范围 — MUST-FIX auth.ts:40 越权写默认分支\n\nAPPROVE')"
+    assert_eq "F3 加粗标题开节，后面的节也是加粗标题" "CONCERNS 1" \
+        "$(_verdict_and_override $'**过度设计 / 范围**\n- 无\n\n**测试**\n- [SHOULD-FIX] b.ts:5 缺少负例\n\nAPPROVE')"
+    assert_eq "F4 节后没有 # 标题，节内散文行写 SHOULD-FIX" "CONCERNS 1" \
+        "$(_verdict_and_override $'## 过度设计 / 范围\n无。\n\n另外一处：[SHOULD-FIX] c.ts:9 错误码文案与 spec 不一致\n\nAPPROVE')"
+    assert_eq "F5 同一行：真 MUST-FIX + 「不计 finding」" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n- [MUST-FIX] a.ts:10 鉴权判断写反（上一条按要求不计 finding，这条是新的）\n\nAPPROVE')"
+    assert_eq "F6 同一行：真 BLOCKER + 「没有新 finding」" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n- [BLOCKER] 迁移会丢数据 0042.sql，除此之外没有新 finding\n\nAPPROVE')"
+    assert_eq "F7 散文行首是「过度设计 / 范围」不开节" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n过度设计 / 范围这一项没有问题。\n- [SHOULD-FIX] d.ts:2 日志打印了 token 前缀\n\nAPPROVE')"
+}
+test_verdict_gate_gate_r1_fail_open_shapes
+
 echo ""
 echo "=== 改动意图（--intent / PR 正文 / commit message）==="
 
