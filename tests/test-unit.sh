@@ -2461,6 +2461,34 @@ test_verdict_gate_chinese_negation_keeps_real_finding() {
 }
 test_verdict_gate_chinese_negation_keeps_real_finding
 
+# 2026-10-19 card-1412：中文引用旧轮不是新 finding。
+# 样本是 pilot #5297 同一头 653ddc57f 上 r3（PR 评论 6267754355）/ r4（6267861727）触发误判的原句：
+# 两处正文都是两行 APPROVE、无编号 finding，却各被「正文有 finding」闸计成 1 条、exit 2。
+test_verdict_gate_chinese_prior_round_refs_not_counted() {
+    source_workflow_funcs
+    assert_eq "#5297 r3 原句：「r1/r2 的 finding」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\nr1/r2 的 finding 历史清楚，本轮重点核对 r3 的注释修正是否与代码事实一致，以及整个 range 的 schema 改动有没有漏掉的调用方。先看关键事实：\n\nAPPROVE')"
+    assert_eq "#5297 r4 原句：「三轮前置 finding」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n三轮前置 finding（顶层宽容用例、j10 注释）均已在 head 落地。\n\nAPPROVE')"
+    assert_eq "「前置 finding」「前 3 轮 finding」「前两轮 finding」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n前置 finding 已修。\n前 3 轮 finding 均已消化。\n前两轮 finding 均已消化。\n\nAPPROVE')"
+}
+test_verdict_gate_chinese_prior_round_refs_not_counted
+
+# 阴性对照：同一行带严重度标签照旧计数；另起一行的新 finding 也照数
+test_verdict_gate_chinese_prior_round_refs_keep_real_finding() {
+    source_workflow_funcs
+    assert_eq "同一行加 [MUST-FIX]：rN/rM 的 finding 照数" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n- [MUST-FIX] r1/r2 的 finding 历史清楚，但本轮改动漏了调用方。\n\nAPPROVE')"
+    assert_eq "同一行加 [MUST-FIX]：N 轮前置 finding 照数" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n- [MUST-FIX] 三轮前置 finding（顶层宽容用例、j10 注释）均已在 head 落地，但这处又丢了。\n\nAPPROVE')"
+    assert_eq "单独一行的新 finding 照数" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n新 finding：`a.ts:3` — 空指针。\n\nAPPROVE')"
+    assert_eq "引用旧轮行 + 另一行真 finding ⇒ 只数真 finding" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\nr1/r2 的 finding 历史清楚。\n1. `b.ts:9` — 竞态。MUST-FIX\n\nAPPROVE')"
+}
+test_verdict_gate_chinese_prior_round_refs_keep_real_finding
+
 # 「过度设计 / 范围」一节：[SHOULD-FIX] 按口径不挡 APPROVE，[BLOCKER] 挡；节外的 SHOULD-FIX 照旧挡
 test_verdict_gate_overdesign_section() {
     source_workflow_funcs

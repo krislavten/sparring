@@ -1250,6 +1250,11 @@ _verdict_of() {
         #   到下一个 # 标题、整行加粗标题或独占的裁决行止；标题行本身照数（同行写的 BLOCKER 不能丢）。
         # - 带严重度标签的行一律计数；否定式与引用旧轮（中英文）只剔除不带标签的行（gate r1 B-2；
         #   英文那半此前也会连标签一起删，sparring r2 指出后一并改。runs/ 里 92 份 APPROVE 原文无一因此翻判）。
+        # 10-19 card-1412（pilot #5297 r3/r4）：
+        # - 中文引用旧轮也剔除：「rN/rM 的 finding」（rN 可带 /rM，中间允许「的」）、
+        #   「前置 finding」「前 N 轮 finding」「N 轮前置 finding」（N 为阿拉伯或中文数字）。
+        #   只剔除不带严重度标签的行，与上面的规则同形；带标签的行上一步已单独计数。
+        #   数字用字面量并列而非 CJK 字符类：C locale 下字符类按字节展开，会误匹配任意中文。
         local _body _lab _bare
         _body=$(printf '%s' "$1" \
             | awk '/^#+[[:space:]]*过度设计[[:space:]]*(\/|／)[[:space:]]*范围/ || /^\*\*过度设计[[:space:]]*(\/|／)[[:space:]]*范围\*\*(：|:)?[[:space:]]*$/ { sec = 1; print; next }
@@ -1258,7 +1263,7 @@ _verdict_of() {
                    { print }')
         _lab=$(printf '%s' "$_body" | grep -cE 'MUST-FIX|SHOULD-FIX|BLOCKER') || _lab=0
         _bare=$(printf '%s' "$_body" | grep -vE 'MUST-FIX|SHOULD-FIX|BLOCKER' \
-            | grep -viE '(no|zero|0) findings?|findings?[ =:]*0\b|\br[0-9]+ finding|上一?轮 finding|finding [0-9]+ 的' \
+            | grep -viE '(no|zero|0) findings?|findings?[ =:]*0\b|\br[0-9]+([[:space:]]*/[[:space:]]*r[0-9]+)*([[:space:]]*的)?[[:space:]]*findings?|上一?轮 finding|finding [0-9]+ 的|前置([[:space:]]*的)?[[:space:]]*findings?|前[[:space:]]*(一|二|三|四|五|六|七|八|九|十|百|千|两|[0-9])+[[:space:]]*轮([[:space:]]*前置)?([[:space:]]*的)?[[:space:]]*findings?|(一|二|三|四|五|六|七|八|九|十|百|千|两|[0-9])+[[:space:]]*轮[[:space:]]*前置([[:space:]]*的)?[[:space:]]*findings?' \
             | grep -vE '(不|未)(计|计入|构成|算|算作|视为|作为|列为|报为)[[:space:]]*(新|新的)?[[:space:]]*[Ff]indings?|(无|没有|零|0[[:space:]]*条)[[:space:]]*(新|新的)?[[:space:]]*[Ff]indings?|候选[[:space:]]*[Ff]indings?.*(凑不齐|否决|排除|不成立)' \
             | grep -c 'finding') || _bare=0
         [[ "$_lab" =~ ^[0-9]+$ ]] || _lab=0
