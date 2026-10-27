@@ -1262,16 +1262,20 @@ _verdict_of() {
                    sec && /^[[:space:]]*[-*][[:space:]]*\[SHOULD-FIX\]/ && !/MUST-FIX|BLOCKER/ { next }
                    { print }')
         _lab=$(printf '%s' "$_body" | grep -cE 'MUST-FIX|SHOULD-FIX|BLOCKER') || _lab=0
-        _bare=$(printf '%s' "$_body" | grep -vE 'MUST-FIX|SHOULD-FIX|BLOCKER' \
+        local _bare_lines
+        _bare_lines=$(printf '%s' "$_body" | grep -vE 'MUST-FIX|SHOULD-FIX|BLOCKER' \
             | grep -viE '(no|zero|0) findings?|findings?[ =:]*0\b|\br[0-9]+([[:space:]]*/[[:space:]]*r[0-9]+)*([[:space:]]*的)?[[:space:]]*findings?|上一?轮 finding|finding [0-9]+ 的|前置([[:space:]]*的)?[[:space:]]*findings?|前[[:space:]]*(一|二|三|四|五|六|七|八|九|十|百|千|两|[0-9])+[[:space:]]*轮([[:space:]]*前置)?([[:space:]]*的)?[[:space:]]*findings?|(一|二|三|四|五|六|七|八|九|十|百|千|两|[0-9])+[[:space:]]*轮[[:space:]]*前置([[:space:]]*的)?[[:space:]]*findings?' \
-            | grep -vE '(不|未)(计|计入|构成|算|算作|视为|作为|列为|报为)[[:space:]]*(新|新的)?[[:space:]]*[Ff]indings?|(无|没有|零|0[[:space:]]*条)[[:space:]]*(新|新的)?[[:space:]]*[Ff]indings?|候选[[:space:]]*[Ff]indings?.*(凑不齐|否决|排除|不成立)' \
-            | grep -c 'finding') || _bare=0
+            | grep -vE '(不|未)(计|计入|构成|算|算作|视为|作为|列为|报为|立为|立成|记为|记作)[[:space:]]*(新|新的)?[[:space:]]*[Ff]indings?|(无|没有|零|0[[:space:]]*条)[[:space:]]*(新|新的)?[[:space:]]*[Ff]indings?|候选[[:space:]]*[Ff]indings?.*(凑不齐|否决|排除|不成立)' \
+            | grep 'finding')
+        _bare=$(printf '%s' "$_bare_lines" | grep -c 'finding') || _bare=0
         [[ "$_lab" =~ ^[0-9]+$ ]] || _lab=0
         [[ "$_bare" =~ ^[0-9]+$ ]] || _bare=0
         _n=$((_lab + _bare))
         [[ "$_n" =~ ^[0-9]+$ ]] || _n=0
         if [[ "$_n" -gt 0 ]]; then
             echo "verdict overridden: body has $_n findings" >&2
+            # 写明触发行，误判时不用读源码猜是哪句（band#321 r3「不立为 finding」实例）
+            [[ -n "$_bare_lines" ]] && printf '%s\n' "$_bare_lines" | head -5 | sed 's/^/  triggered by: /' >&2
             v=CONCERNS
         fi
     fi

@@ -2447,8 +2447,19 @@ test_verdict_gate_chinese_negation_not_counted() {
         "$(_verdict_and_override $'APPROVE\n\n**候选 finding 逐一否决**：三处均凑不齐具体失败场景。\n\nAPPROVE')"
     assert_eq "「不构成 finding」「不算 finding」「无新 finding」不计数" "APPROVE 0" \
         "$(_verdict_and_override $'APPROVE\n\n注释措辞不构成 finding。\n测试命名不算 finding。\n本轮无新 finding。\n\nAPPROVE')"
+    assert_eq "band#321 r3：「不立为 finding」不计数" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n唯一的候选 nit 凑不齐「会真出错」的场景，不立为 finding。\n\nAPPROVE')"
 }
 test_verdict_gate_chinese_negation_not_counted
+
+# 被强制改判时 stderr 写明触发行（band#321 r3 误判排查用）
+test_verdict_override_names_trigger_line() {
+    source_workflow_funcs
+    local err
+    err=$(_verdict_of $'APPROVE\n\n这一行有 finding 要报。\n\nAPPROVE' 2>&1 >/dev/null)
+    assert_eq "改判时 stderr 带触发行" "1" "$(printf '%s' "$err" | grep -c 'triggered by: 这一行有 finding 要报')"
+}
+test_verdict_override_names_trigger_line
 
 # 阴性对照：排除按行生效，同一份正文里另有一行真 finding 时照样翻 CONCERNS
 # （排除若写成「整份正文有否定式就不数」，这条会绿着放过真 finding）
