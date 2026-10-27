@@ -2456,8 +2456,15 @@ test_verdict_gate_chinese_negation_not_counted
 test_verdict_override_names_trigger_line() {
     source_workflow_funcs
     local err
-    err=$(_verdict_of $'APPROVE\n\n这一行有 finding 要报。\n\nAPPROVE' 2>&1 >/dev/null)
-    assert_eq "改判时 stderr 带触发行" "1" "$(printf '%s' "$err" | grep -c 'triggered by: 这一行有 finding 要报')"
+    err=$(_verdict_of $'APPROVE\n\n1. a.ts:3 — 这一行有 finding 要报\n\nAPPROVE' 2>&1 >/dev/null)
+    assert_eq "改判时 stderr 带触发行" "1" "$(printf '%s' "$err" | grep -c 'triggered by: 1. a.ts:3 — 这一行有 finding 要报')"
+    # 结构化判据：没有位置的「finding」措辞不改判，只 WARN（band#322「未达 finding 门槛」实例）
+    assert_eq "band#322：「未达 finding 门槛」不改判" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n两处疑点都未达 finding 门槛。\n\n## 过度设计 / 范围\n无\n\nAPPROVE')"
+    err=$(_verdict_of $'APPROVE\n\n两处疑点都未达 finding 门槛。\n\nAPPROVE' 2>&1 >/dev/null)
+    assert_eq "无位置的 finding 措辞打 WARN" "1" "$(printf '%s' "$err" | grep -c '^WARN verdict APPROVE kept')"
+    assert_eq "#3402 形态：正文独占 CONCERNS + 末行 APPROVE ⇒ CONCERNS" "CONCERNS" \
+        "$(_verdict_of $'CONCERNS\n\n1. a.ts:3 — 空指针\n\nAPPROVE' 2>/dev/null)"
 }
 test_verdict_override_names_trigger_line
 
@@ -2467,7 +2474,7 @@ test_verdict_gate_chinese_negation_keeps_real_finding() {
     source_workflow_funcs
     assert_eq "否定式行 + 另一行 MUST-FIX ⇒ CONCERNS" "CONCERNS 1" \
         "$(_verdict_and_override $'APPROVE\n\n注释措辞不算 finding。\n1. `a.ts:3` — 空指针。MUST-FIX\n\nAPPROVE')"
-    assert_eq "「无法复现的 finding」不是否定式，照数" "CONCERNS 1" \
+    assert_eq "「无法复现的 finding」是散文、不是契约条目：只 WARN 不改判（10-27 结构化）" "APPROVE 0" \
         "$(_verdict_and_override $'APPROVE\n\n一条无法复现的 finding：`b.ts:9` 竞态。\n\nAPPROVE')"
 }
 test_verdict_gate_chinese_negation_keeps_real_finding
@@ -2493,8 +2500,12 @@ test_verdict_gate_chinese_prior_round_refs_keep_real_finding() {
         "$(_verdict_and_override $'APPROVE\n\n- [MUST-FIX] r1/r2 的 finding 历史清楚，但本轮改动漏了调用方。\n\nAPPROVE')"
     assert_eq "同一行加 [MUST-FIX]：N 轮前置 finding 照数" "CONCERNS 1" \
         "$(_verdict_and_override $'APPROVE\n\n- [MUST-FIX] 三轮前置 finding（顶层宽容用例、j10 注释）均已在 head 落地，但这处又丢了。\n\nAPPROVE')"
-    assert_eq "单独一行的新 finding 照数" "CONCERNS 1" \
+    assert_eq "散文写的新 finding 不改判，只 WARN（10-27 结构化）" "APPROVE 0" \
         "$(_verdict_and_override $'APPROVE\n\n新 finding：`a.ts:3` — 空指针。\n\nAPPROVE')"
+    assert_eq "契约条目 N. path:line 照数" "CONCERNS 1" \
+        "$(_verdict_and_override $'APPROVE\n\n1. `a.ts:3` — 空指针。\n\nAPPROVE')"
+    assert_eq "APPROVE 正文里列核实位置的 - 列表不改判（1301/5369 回放）" "APPROVE 0" \
+        "$(_verdict_and_override $'APPROVE\n\n- `a.ts:3` 的判据原文与注释一致。\n\nAPPROVE')"
     assert_eq "引用旧轮行 + 另一行真 finding ⇒ 只数真 finding" "CONCERNS 1" \
         "$(_verdict_and_override $'APPROVE\n\nr1/r2 的 finding 历史清楚。\n1. `b.ts:9` — 竞态。MUST-FIX\n\nAPPROVE')"
 }
