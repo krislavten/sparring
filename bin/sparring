@@ -1181,12 +1181,26 @@ _opencode_gateway_setup() {
     fi
     # 密钥落盘期间只对自己可读
     chmod 600 "$f" 2>/dev/null || true
+    # external_directory 放行（card-3186）：reviewer 在 /var/folders/.../sparring-snapshot/
+    # 下跑，opencode 对「命令碰了 cwd 之外的路径」默认要权限确认；非交互 run 模式没有
+    # 人点同意，它 auto-reject 并**整轮中止**，stdout 只剩开场白、exit 0，上层解析不出
+    # 裁决就落 claude 兜底腿。v4.1 比 v4-flash 更爱出快照去核宿主机状态（node 版本、
+    # plist 实际指向），失败率因此从 ~3% 升到 ~12%。只改 sparring 的临时配置，
+    # 不碰用户全局 opencode.json。
+    # plan.steps 上限（card-3186）：放行之后 v4.1 会一路核到底——实测一轮 71 步 /
+    # 265k reasoning / 40 分钟，而前 30 步只用了 7 分钟、覆盖了绝大部分 diff。
+    # opencode 的 steps = "Maximum number of agentic iterations before forcing text-only
+    # response"，到点强制它写文本，协约要求的裁决词就是文本，所以不会变成无裁决。
+    # 与环境变量 SPARRING_OPENCODE_STEPS 同名可覆盖（排查时想放宽不必改脚本）。
     if ! jq -n \
             --arg p "$_OPENCODE_GW_PROVIDER" \
             --arg url "$base_url" \
             --arg key "$api_key" \
             --arg m "$model" \
-            '{provider: {($p): {npm: "@ai-sdk/openai-compatible", name: "Sparring Gateway",
+            --argjson steps "${SPARRING_OPENCODE_STEPS:-30}" \
+            '{permission: {external_directory: "allow"},
+              agent: {plan: {steps: $steps}},
+              provider: {($p): {npm: "@ai-sdk/openai-compatible", name: "Sparring Gateway",
               options: {baseURL: $url, apiKey: $key}, models: {($m): {name: $m}}}}}' \
             > "$f" 2>/dev/null; then
         rm -f "$f" 2>/dev/null || true
@@ -1393,13 +1407,34 @@ _call_backend() {
     [[ -n "$gw_config" ]] && echo -e "${DIM}  经 opencode.base_url 网关（临时配置，用完删）${NC}" >&2
 
     local i ok=false rc=0 last_rc=0
+    # 无裁决重试（card-3186）：opencode 腿 exit 0 但输出里没有裁决词时，按本腿失败处理，
+    # 同模型重试 1 次再走降级链。典型场景是 reviewer 越出只读快照去读宿主机路径，
+    # 被 opencode 的 external_directory 权限 auto-reject 后整轮中止，stdout 只剩开场白
+    # ——同模型的瞬态失败，重跑一次比直接烧 claude 兜底额度划算。claude 腿不适用
+    # （走原生 /code-review 的契约，输出格式由 _normalize_code_review_output 单独翻译）。
+    local verdict_retries=0
     _heartbeat_start "$label"
-    for i in $(seq 1 "$max_attempts"); do
+    i=0
+    while :; do
+        i=$(( i + 1 ))
         rc=0
         ( cd "$run_cwd" && _timeout_cmd "$timeout_s" \
                 env ${envs[@]+"${envs[@]}"} "${AGENT_CMD[@]}" \
                 < "$prompt_file" > "$output_file" 2>"$log_file" ) || rc=$?
         if [[ $rc -eq 0 ]]; then
+            if [[ "$backend" == "opencode" ]] \
+                    && [[ -z "$(_verdict_of "$(_strip_agent_noise < "$output_file")")" ]]; then
+                if [[ $verdict_retries -lt 1 ]]; then
+                    verdict_retries=$(( verdict_retries + 1 ))
+                    echo -e "${DIM}  ${backend} exit 0 但输出无裁决（沙箱拒权中止？），同模型重试一次...${NC}" >&2
+                    sleep 2
+                    continue
+                fi
+                # 重试用尽仍无裁决：按本腿失败走失败路径（last_rc 留 0 标记，
+                # 失败块据此归 parse 而不再误记 crash）
+                last_rc=0
+                break
+            fi
             ok=true
             break
         fi
@@ -1410,6 +1445,8 @@ _call_backend() {
         if [[ $i -lt $max_attempts ]]; then
             echo -e "${DIM}  ${backend} 调用失败（退出码 ${rc}），重试 ($i/$max_attempts)...${NC}" >&2
             sleep 2
+        else
+            break
         fi
     done
     _heartbeat_stop
@@ -1420,12 +1457,23 @@ _call_backend() {
         # 失败留样必须赶在 eval "$_cleanup" 删掉临时文件之前写
         _why="crash"
         [[ $last_rc -eq 124 ]] && _why="timeout"
+        # exit 0 却拿不到裁决：stdout 空白归 empty（现场在 stderr），有字但没裁决词归 parse
+        if [[ $last_rc -eq 0 ]]; then
+            if [[ -z "$(_strip_agent_noise < "$output_file")" ]]; then _why="empty"; else _why="parse"; fi
+        fi
         _sample=$(_error_sample_write "$_why" "$backend" "$last_rc" "$output_file" "$log_file")
         [[ -n "$_sample" ]] && _error_sample_record "$_sample"
         eval "$_cleanup"
         if [[ $last_rc -eq 124 ]]; then
             _error_reason_record timeout
             echo -e "${RED}错误: ${backend} 超时 ${timeout_s}s，已杀掉整个进程组（超时不重试）${NC}" >&2
+        elif [[ $last_rc -eq 0 ]]; then
+            _error_reason_record "$_why"
+            if [[ "$_why" == "empty" ]]; then
+                echo -e "${RED}错误: ${backend} 返回空结果${NC}" >&2
+            else
+                echo -e "${YELLOW}⚠ ${backend} 重试用尽仍无裁决（输出里没有 APPROVE/CONCERNS）${NC}" >&2
+            fi
         else
             _error_reason_record crash
             echo -e "${RED}错误: ${backend} 调用失败，退出码 ${last_rc} (共 ${max_attempts} 次尝试)${NC}" >&2
