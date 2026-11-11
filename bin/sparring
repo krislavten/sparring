@@ -1192,13 +1192,23 @@ _opencode_gateway_setup() {
     # opencode 的 steps = "Maximum number of agentic iterations before forcing text-only
     # response"，到点强制它写文本，协约要求的裁决词就是文本，所以不会变成无裁决。
     # 与环境变量 SPARRING_OPENCODE_STEPS 同名可覆盖（排查时想放宽不必改脚本）。
+    # 凭据目录 deny（card-3186 安全跟进）：整体放行 external_directory 之后，reviewer
+    # 理论上能读 ~/.ssh、~/.cc-switch 这类文件，而读到的内容会发给模型网关。
+    # opencode 的 permission 支持「路径模式 → effect」，实测
+    # {"*":"allow","<home>/.ssh/*":"deny"} 下 `cat ~/.ssh/id_rsa` 被规则直接挡下，
+    # 普通外部路径照常放行。注意它由命令分类器触发、不是硬沙箱：ls / wc 这类命令
+    # 根本不进权限检查，所以这一层挡的是「读凭据」的主流路径，不当沙箱承诺。
+    # 家目录根下的散装文件（~/.zshrc、~/.netrc）无法单独 deny——它们的检查资源是
+    # "<home>/*"，deny 它等于整体不放行，得不偿失。
     if ! jq -n \
             --arg p "$_OPENCODE_GW_PROVIDER" \
             --arg url "$base_url" \
             --arg key "$api_key" \
             --arg m "$model" \
+            --arg home "$HOME" \
             --argjson steps "${SPARRING_OPENCODE_STEPS:-30}" \
-            '{permission: {external_directory: "allow"},
+            --argjson deny '["/.ssh/*","/.aws/*","/.cc-switch/*","/.config/*","/.claude/*","/.kube/*","/.docker/*","/.local/share/opencode/*"]' \
+            '{permission: {external_directory: ({"*": "allow"} + ($deny | map({($home + .): "deny"}) | add))},
               agent: {plan: {steps: $steps}},
               provider: {($p): {npm: "@ai-sdk/openai-compatible", name: "Sparring Gateway",
               options: {baseURL: $url, apiKey: $key}, models: {($m): {name: $m}}}}}' \

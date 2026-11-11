@@ -2780,7 +2780,10 @@ test_gateway_generates_config() {
         # agent.plan.steps 也是 card-3186：放行后 v4.1 会一路核到底（实测 71 步 40 分钟），
         # 卡到 30 步让它强制收口出裁决。
         assert_eq "顶层键只有 agent + permission + provider" "agent,permission,provider" "$(jq -r 'keys | join(",")' "$cfg")"
-        assert_eq "放行快照外的目录访问" "allow" "$(jq -r '.permission.external_directory' "$cfg")"
+        assert_eq "其余外部路径放行" "allow" "$(jq -r '.permission.external_directory["*"]' "$cfg")"
+        assert_eq "凭据目录 deny（~/.ssh）" "deny" "$(jq -r --arg k "$HOME/.ssh/*" '.permission.external_directory[$k]' "$cfg")"
+        assert_eq "凭据目录 deny（~/.cc-switch）" "deny" "$(jq -r --arg k "$HOME/.cc-switch/*" '.permission.external_directory[$k]' "$cfg")"
+        assert_eq "凭据目录 deny（opencode auth）" "deny" "$(jq -r --arg k "$HOME/.local/share/opencode/*" '.permission.external_directory[$k]' "$cfg")"
         assert_eq "plan agent 步数上限" "30" "$(jq -r '.agent.plan.steps' "$cfg")"
         rm -f "$cfg"
     fi
