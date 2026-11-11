@@ -546,6 +546,51 @@ test_call_backend_opencode_cmd() {
 }
 test_call_backend_opencode_cmd
 
+test_call_backend_opencode_retry_on_no_verdict() {
+    source_workflow_funcs
+    # 第一次 exit 0 只吐开场白（沙箱拒权后整轮中止的形态），第二次才吐裁决：
+    # 期望同模型自动重试一次并拿到裁决，而不是把整轮判死、去烧 claude 兜底腿。
+    local dir count_file result
+    dir="$TMP_DIR/mock-oc-retry-$RANDOM"; mkdir -p "$dir"
+    count_file="$TMP_DIR/oc-retry-count-$RANDOM"; : > "$count_file"
+    cat > "$dir/opencode" <<MOCK
+#!/bin/bash
+cat > /dev/null
+n=\$(wc -l < "$count_file" | tr -d ' ')
+n=\$((n+1)); echo "\$n" >> "$count_file"
+if [ "\$n" -lt 2 ]; then echo "I'll start by examining the diff."; else echo "APPROVE"; fi
+MOCK
+    chmod +x "$dir/opencode"
+    result=$(PATH="$dir:$PATH" _call_backend opencode "p" "$TMP_DIR" 2>/dev/null)
+    assert_contains "无裁决后同模型重试并拿到裁决" "APPROVE" "$result"
+    assert_eq "确实跑了两次" "2" "$(wc -l < "$count_file" | tr -d ' ')"
+}
+test_call_backend_opencode_retry_on_no_verdict
+
+test_call_backend_opencode_no_verdict_twice_is_parse_error() {
+    source_workflow_funcs
+    # 两次都只有开场白：重试用尽 → 返回 1，原因记 parse（不是 crash），
+    # 上层据此走降级链，读数里也能和真崩溃区分开。
+    local dir count_file reason_file rc=0
+    dir="$TMP_DIR/mock-oc-nv-$RANDOM"; mkdir -p "$dir"
+    count_file="$TMP_DIR/oc-nv-count-$RANDOM"; : > "$count_file"
+    reason_file="$TMP_DIR/oc-nv-reason-$RANDOM"; : > "$reason_file"
+    cat > "$dir/opencode" <<MOCK
+#!/bin/bash
+cat > /dev/null
+n=\$(wc -l < "$count_file" | tr -d ' ')
+n=\$((n+1)); echo "\$n" >> "$count_file"
+echo "I'll start by examining the diff."
+MOCK
+    chmod +x "$dir/opencode"
+    SPARRING_ERROR_REASON_FILE="$reason_file" PATH="$dir:$PATH" \
+        _call_backend opencode "p" "$TMP_DIR" >/dev/null 2>&1 || rc=$?
+    assert_eq "两次都无裁决 → 调用失败" "1" "$rc"
+    assert_eq "只重试一次，共跑两次" "2" "$(wc -l < "$count_file" | tr -d ' ')"
+    assert_eq "失败原因记为 parse" "parse" "$(tr -d '\n' < "$reason_file")"
+}
+test_call_backend_opencode_no_verdict_twice_is_parse_error
+
 test_call_backend_no_model_flag_when_unset() {
     source_workflow_funcs
     local dir dump
@@ -2729,8 +2774,14 @@ test_gateway_generates_config() {
         assert_eq "model 登记在 provider 下" "gpt-test" "$(jq -r '.provider["sparring-gw"].models["gpt-test"].name' "$cfg")"
         # 密钥落盘期间不能让同机器其他用户读到
         assert_eq "临时配置权限 600" "600" "$(stat -f '%Lp' "$cfg" 2>/dev/null || stat -c '%a' "$cfg")"
-        # 只写 provider 块：OPENCODE_CONFIG 是合并语义，写多了会覆盖用户自己的设置
-        assert_eq "只含 provider 一个顶层键" "provider" "$(jq -r 'keys | join(",")' "$cfg")"
+        # 只写必要的顶层键：OPENCODE_CONFIG 是合并语义，写多了会覆盖用户自己的设置。
+        # permission 是 card-3186 加的：reviewer 跑在 /var/folders 的快照里，
+        # opencode 默认对快照之外的路径要权限确认，非交互模式 auto-reject 会整轮中止。
+        # agent.plan.steps 也是 card-3186：放行后 v4.1 会一路核到底（实测 71 步 40 分钟），
+        # 卡到 30 步让它强制收口出裁决。
+        assert_eq "顶层键只有 agent + permission + provider" "agent,permission,provider" "$(jq -r 'keys | join(",")' "$cfg")"
+        assert_eq "放行快照外的目录访问" "allow" "$(jq -r '.permission.external_directory' "$cfg")"
+        assert_eq "plan agent 步数上限" "30" "$(jq -r '.agent.plan.steps' "$cfg")"
         rm -f "$cfg"
     fi
     rm -f "$CONFIG_FILE_GLOBAL"
