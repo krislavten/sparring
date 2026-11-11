@@ -198,6 +198,8 @@ echo "建议用 Redis 做缓存，理由是……" | sparring review --title "�
 
 > 🔒 **快照的"只读"是什么意思**：reviewer 手里有 Bash（不然它跑不了 `git diff`），工具层面挡不住它写文件。这里的只读靠的是 detached（不动任何分支）+ 审完即删，不是文件系统权限；快照与主仓库共用 `.git` 对象库。别把它当沙箱用。
 
+> 🔒 **快照外读取的边界**：opencode 腿放行了快照外的目录（否则 reviewer 核宿主机状态会被 auto-reject 直接中止整轮），凭据目录（`~/.ssh`、`~/.aws`、`~/.cc-switch`、`~/.config`、`~/.claude`、`~/.kube`、`~/.docker`、`~/.local/share/opencode`）显式 deny。但这层由 opencode 的命令分类器触发，`ls`/`wc` 这类命令根本不进检查，家目录根的散装文件也 deny 不了——**它挡的是读凭据的主流路径，不是隔离承诺**；要硬隔离得靠容器或独立用户。
+
 ---
 
 ## 🎛️ 审查后端
