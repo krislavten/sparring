@@ -2737,6 +2737,55 @@ test_resolve_secret() {
 }
 test_resolve_secret
 
+test_resolve_secret_agentcred() {
+    source_workflow_funcs
+    local stub_dir="$TMP_DIR/agentcred-stub" err="$TMP_DIR/agentcred.err"
+    mkdir -p "$stub_dir"
+    cat > "$stub_dir/agentcred" <<'STUB'
+#!/bin/bash
+[[ "$#" == 2 && "$1" == path ]] || exit 1
+case "$2" in
+    unit-key) printf '%s\n' "$SPARRING_TEST_CREDENTIAL_FILE" ;;
+    unreadable) printf '%s\n' "$SPARRING_TEST_CREDENTIAL_FILE.missing" ;;
+    empty-path) exit 0 ;;
+    *) printf 'stub output must not escape\n'; printf 'stub error must not escape\n' >&2; exit 1 ;;
+esac
+STUB
+    chmod +x "$stub_dir/agentcred"
+    local PATH="$stub_dir:$PATH"
+    export SPARRING_TEST_CREDENTIAL_FILE="$TMP_DIR/unit credential"
+    printf 'unit-value\nline-two\n\n' > "$SPARRING_TEST_CREDENTIAL_FILE"
+    local result status=0
+    result=$(_resolve_secret 'agentcred:unit-key' 2>"$err") || status=$?
+    assert_eq "agentcred 读取文件并只去尾换行" $'unit-value\nline-two' "$result"
+    assert_eq "agentcred 成功时无诊断" "" "$(cat "$err")"
+    assert_eq "agentcred 成功时返回 0" "0" "$status"
+
+    local name
+    for name in missing unreadable empty-path ''; do
+        status=0
+        result=$(_resolve_secret "agentcred:$name" 2>"$err") || status=$?
+        assert_eq "agentcred 失败输出为空（${name}）" "" "$result"
+        assert_eq "agentcred 失败仍返回 0（${name}）" "0" "$status"
+        assert_eq "agentcred 失败仅诊断名字（${name}）" "sparring: cannot resolve agentcred:$name" "$(cat "$err")"
+    done
+    status=0
+    result=$(PATH="$stub_dir/no-command" _resolve_secret 'agentcred:unit-key' 2>"$err") || status=$?
+    assert_eq "agentcred 不在 PATH 时输出为空" "" "$result"
+    assert_eq "agentcred 不在 PATH 时返回 0" "0" "$status"
+    assert_eq "工具缺失仅诊断名字" "sparring: cannot resolve agentcred:unit-key" "$(cat "$err")"
+
+    # 失败值走生产调用点已有的「配置不齐」分支，不生成网关配置。
+    mkdir -p "$CONFIG_DIR_GLOBAL"
+    echo '{"opencode":{"model":"m1","base_url":"https://gw.example/v1","api_key":"agentcred:missing"}}' > "$CONFIG_FILE_GLOBAL"
+    _opencode_gateway_setup 2>"$err"
+    assert_eq "agentcred 失败不生成网关配置" "" "$_OPENCODE_GW_CONFIG"
+    assert_eq "agentcred 失败保留原 model" "m1" "$_OPENCODE_GW_MODEL"
+    rm -f "$CONFIG_FILE_GLOBAL"
+    unset SPARRING_TEST_CREDENTIAL_FILE
+}
+test_resolve_secret_agentcred
+
 test_gateway_not_configured() {
     source_workflow_funcs
     echo '{"opencode":{"model":"some/model"}}' > "$CONFIG_FILE_GLOBAL"

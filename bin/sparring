@@ -1148,10 +1148,22 @@ _agent_cmd_opencode() {
 _OPENCODE_GW_PROVIDER="sparring-gw"
 _OPENCODE_GW_CONFIG=""
 
-# 密钥支持 $ENV_VAR 形式引用环境变量，这样配置文件里可以不落明文
+# 密钥支持 $ENV_VAR / agentcred:<name> 引用，这样配置文件里可以不落明文
 _resolve_secret() {
     local raw="$1"
-    if [[ "$raw" == \$* ]]; then
+    if [[ "$raw" == agentcred:* ]]; then
+        local name="${raw#agentcred:}" path value
+        # 不透传 agentcred / 文件读取的错误内容，诊断只包含引用名。
+        if ! path=$(agentcred path "$name" 2>/dev/null) || [[ -z "$path" ]]; then
+            printf 'sparring: cannot resolve agentcred:%s\n' "$name" >&2
+            return 0
+        fi
+        if ! value=$(cat -- "$path" 2>/dev/null); then
+            printf 'sparring: cannot resolve agentcred:%s\n' "$name" >&2
+            return 0
+        fi
+        printf '%s' "$value"
+    elif [[ "$raw" == \$* ]]; then
         local var="${raw#\$}"
         printf '%s' "${!var:-}"
     else
