@@ -4,6 +4,7 @@
 
 ### 新增
 
+- **凭据引用**：`opencode.api_key` 支持 `agentcred:<name>`，通过 `agentcred path <name>` 读取凭据文件并去除尾部换行，配置无需保存明文。工具不可用、路径获取或文件读取失败时按空值处理，沿用配置不齐分支；错误只记录引用名。
 - **改动意图 + 「过度设计 / 范围」一节**：`sparring review --range` 新增 `--intent "<文本>"` / `--intent-file <路径>`；没给时依次取 range 右端 commit 作 head 的 PR 正文（`gh api`，20s 超时）、range 内的 commit message（`a...b` 按 `a..b` 取，不混进 main 侧）。opencode 腿与 claude 统一模式的方法论新增意图对照与固定的「过度设计 / 范围」一节；该节 `[SHOULD-FIX]` 不挡 APPROVE，`[BLOCKER]`（超出意图且改了行为）挡。`claude.range_mode=native` 只收到意图文本，不带这一节的输出契约。
 - **裁决一致性闸**：中文否定式（「不计 finding」「未报为 finding」「候选 finding 均凑不齐」等）不再计成 finding；「过度设计 / 范围」一节（`#` 标题或整行加粗标题开）里只豁免 `- [SHOULD-FIX] …` 列表行；带 `MUST-FIX` / `SHOULD-FIX` / `BLOCKER` 标签的行一律计数，否定式与引用旧轮的剔除只作用于不带标签的行（此前英文否定式会连同行标签一起删）。
 
